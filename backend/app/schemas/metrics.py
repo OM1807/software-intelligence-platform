@@ -14,3 +14,14 @@ class HealthSummary(BaseModel):
     total_files: int
     total_commits: int
     high_risk_files: int
+
+class TimelinePoint(BaseModel):
+    date: str
+    commits: int
+    health_index: float
+
+
+class DashboardOut(BaseModel):
+    repo_id: int
+    summary: HealthSummary
+    timeline: list[TimelinePoint]

@@ -40,8 +40,9 @@ def health():
     return {"status": "ok"}
 
 
-# Routers get added here once the endpoints are built:
-from app.api.endpoints import auth  # noqa: E402
+from app.api.endpoints import analysis, auth, dashboard, repositories  # noqa: E402
 
 app.include_router(auth.router, prefix="/auth", tags=["auth"])
-
+app.include_router(repositories.router, prefix="/repositories", tags=["repositories"])
+app.include_router(analysis.router, prefix="/analysis", tags=["analysis"])
+app.include_router(dashboard.router, prefix="/dashboard", tags=["dashboard"])

@@ -23,3 +23,14 @@ class AnalysisOut(BaseModel):
     summary: HealthSummary
     risky_files: list[FileMetric]
     explanation: str | None = None  # LLM-generated text (Phase 4)
+
+class DriftViolation(BaseModel):
+    source: str
+    target: str
+    rule: str
+    severity: str  # low | medium | high
+
+
+class DriftReport(BaseModel):
+    repo_id: int
+    violations: list[DriftViolation]
