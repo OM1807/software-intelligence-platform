@@ -1,16 +1,44 @@
-# Node/React
-frontend/node_modules/
-frontend/dist/
-frontend/.env
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+venv/
+.venv/
+env/
 
-# Python/FastAPI
-backend/__pycache__/
-backend/venv/
-backend/env/
-backend/.env
-backend/.pytest_cache/
-backend/alembic.ini
+# ---------- Node / React ----------
+node_modules/
+dist/
+build/
+.vite/
+*.tsbuildinfo
+npm-debug.log*
+yarn-error.log*
 
-# OS Files
+# ---------- Secrets / env ----------
+.env
+.env.*
+!.env.example
+
+# ---------- App data ----------
+sip_repos/        # cloned repositories (REPOS_DIR)
+*.db
+*.sqlite3
+*.log
+postgres_data/
+
+# ---------- Reports / temp ----------
+reports/
+tmp/
+
+# ---------- IDE / OS ----------
+.vscode/
+.idea/
+*.swp
 .DS_Store
 Thumbs.db

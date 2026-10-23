@@ -17,6 +17,7 @@ class Settings(BaseSettings):
     BACKEND_URL: str = "http://localhost:8000"
 
     LLM_API_KEY: str = ""
+    REPOS_DIR: str = "/tmp/sip_repos"  # where cloned repos are stored
 
 
 settings = Settings()
