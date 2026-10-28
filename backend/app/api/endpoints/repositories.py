@@ -1,4 +1,5 @@
-import re
+﻿import re
+from urllib.parse import urlparse
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from sqlalchemy.orm import Session
@@ -12,6 +13,34 @@ from app.schemas.repo import RepoImport, RepoOut
 router = APIRouter()
 
 GITHUB_URL = re.compile(r"github\.com[/:]([^/]+)/([^/]+?)(?:\.git)?/?$")
+
+
+def _parse_github_repo(value: str) -> tuple[str, str]:
+    if not value or not value.strip():
+        raise HTTPException(status_code=400, detail="Repository URL is required")
+
+    candidate = value.strip()
+    if "@" in candidate and ":" in candidate:
+        ssh_match = re.fullmatch(r"git@github\.com:([^/]+)/([^/]+?)(?:\.git)?/?", candidate)
+        if ssh_match:
+            return ssh_match.group(1), ssh_match.group(2)
+        raise HTTPException(status_code=400, detail="Invalid GitHub repository URL")
+
+    parsed = urlparse(candidate)
+    if parsed.scheme not in {"http", "https"} or parsed.hostname != "github.com":
+        raise HTTPException(status_code=400, detail="Only GitHub HTTPS URLs are supported")
+    if parsed.username or parsed.password:
+        raise HTTPException(status_code=400, detail="Repository URL must not contain credentials")
+    if parsed.path.count("/") != 2 or parsed.path.startswith("/") is False:
+        raise HTTPException(status_code=400, detail="Invalid GitHub repository URL")
+
+    path_parts = [p for p in parsed.path.split("/") if p and p != "/"]
+    if len(path_parts) != 2:
+        raise HTTPException(status_code=400, detail="Invalid GitHub repository URL")
+    owner, name = path_parts
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", owner) or not re.fullmatch(r"[A-Za-z0-9_.-]+", name):
+        raise HTTPException(status_code=400, detail="Invalid GitHub repository owner or name")
+    return owner, name
 
 
 def get_user_repo(db: Session, repo_id: int, user: User) -> Repository:
@@ -28,10 +57,7 @@ def import_repository(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    m = GITHUB_URL.search(body.url.strip())
-    if not m:
-        raise HTTPException(status_code=400, detail="Invalid GitHub repository URL")
-    owner, name = m.groups()
+    owner, name = _parse_github_repo(body.url)
 
     repo = db.query(Repository).filter_by(user_id=user.id, owner=owner, name=name).first()
     if not repo:
@@ -39,14 +65,13 @@ def import_repository(
                           url=f"https://github.com/{owner}/{name}")
         db.add(repo)
     elif repo.status == "processing":
-        return repo  # already running; the frontend just keeps polling
+        return repo
 
     repo.status = "processing"
     repo.error = None
     db.commit()
     db.refresh(repo)
 
-    # Pasted PAT wins; otherwise use the token saved at login (needed for private repos)
     token = body.access_token or user.github_token
     background.add_task(run_analysis, repo.id, token)
     return repo

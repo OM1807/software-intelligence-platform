@@ -5,8 +5,8 @@ from pathlib import Path
 
 import httpx
 
+from app.core import database as database_module
 from app.core.config import settings
-from app.core.database import SessionLocal
 from app.engine import git_miner, parser
 from app.engine.dependency_graph import build_dependency_graph
 from app.engine.risk_calculator import recalculate_file_risk_scores
@@ -70,7 +70,7 @@ def apply_graph_metrics(rows: list[FileMetric], graph: dict) -> None:
 
 def run_analysis(repo_id: int, token: str | None = None) -> None:
     """Runs in a background task. Always leaves the repo as 'completed' or 'failed'."""
-    db = SessionLocal()
+    db = database_module.SessionLocal()
     try:
         repo = db.get(Repository, repo_id)
         if repo is None:
