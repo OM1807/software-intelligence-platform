@@ -15,6 +15,32 @@ A software engineering analytics platform for analyzing repository structure, de
 
 Core analysis is designed to work without an LLM.
 
+## Backend Phase 1 analytics
+
+The backend now computes deterministic per-file risk scores from repository data that is actually stored in the database. The score is bounded to [0.0, 1.0] and is derived from weighted normalized signals:
+
+- complexity: 35%
+- churn: 25%
+- contributor spread: 10%
+- centrality: 10%
+- dependency intensity: 10%
+- cycle flag: 5%
+- parse errors: 5%
+
+The normalized values use log scaling so a very large repository or a large file does not make all other files appear risk-free. A file is counted as high risk when `risk_score >= 0.7`.
+
+The health index is derived from the average file risk and reported as a 0–100 value where higher is healthier: `health_index = (1 - average risk) * 100`.
+
+The repository analysis, risk, dashboard, and drift endpoints are owner-protected and use persisted repository metrics instead of mock data. Repositories that are still processing or failed return HTTP `409` with a clear status message instead of pretending to have analysis results.
+
+## Backend verification
+
+Run the backend tests from the `backend/` directory:
+
+```bash
+python -m pytest -q
+```
+
 ## Tech Stack
 
 - **Frontend:** React, TypeScript

@@ -8,6 +8,7 @@ from app.api.endpoints.auth import get_current_user
 from app.api.endpoints.repositories import get_user_repo
 from app.core.database import get_db
 from app.engine.llm_service import generate_ai_response
+from app.engine.risk_calculator import HIGH_RISK_THRESHOLD, compute_health_index, recalculate_file_risk_scores
 from app.models.schema import Analysis, DependencyEdge, FileMetric as FileMetricRow, User
 from app.schemas.analysis import (
     AnalysisOut,
@@ -17,7 +18,7 @@ from app.schemas.analysis import (
     GraphEdge,
     GraphNode,
 )
-from app.schemas.metrics import FileMetric, HealthSummary
+from app.schemas.metrics import FileMetric as PublicFileMetric, HealthSummary
 
 logger = logging.getLogger(__name__)
 
@@ -33,30 +34,76 @@ class AITestRequest(BaseModel):
     )
 
 
-# Existing mock data
-MOCK_FILES = [
-    FileMetric(
-        path="src/core/engine.py",
-        loc=820,
-        complexity=34.5,
-        churn=61,
-        risk_score=0.91,
-    ),
-    FileMetric(
-        path="src/api/routes.py",
-        loc=410,
-        complexity=18.2,
-        churn=40,
-        risk_score=0.72,
-    ),
-    FileMetric(
-        path="src/utils/helpers.py",
-        loc=150,
-        complexity=6.1,
-        churn=12,
-        risk_score=0.28,
-    ),
-]
+def _serialize_file_metric(row: FileMetricRow) -> PublicFileMetric:
+    risk_score = row.risk_score if row.risk_score is not None else 0.0
+    return PublicFileMetric(
+        path=row.path,
+        loc=row.loc,
+        complexity=float(row.avg_complexity or 0.0),
+        churn=int((row.commits or 0) + (row.lines_added or 0) + (row.lines_deleted or 0)),
+        risk_score=float(risk_score),
+    )
+
+
+def _build_risk_list(repo_id: int, db: Session, limit: int = 10, skip: int = 0) -> list[PublicFileMetric]:
+    rows = db.query(FileMetricRow).filter_by(repo_id=repo_id).all()
+    if not rows:
+        return []
+
+    rows = recalculate_file_risk_scores(rows)
+    rows = sorted(rows, key=lambda row: (row.risk_score or 0.0, row.path), reverse=True)
+    rows = rows[skip: skip + limit]
+    return [_serialize_file_metric(row) for row in rows]
+
+
+def _build_analysis_summary(repo_id: int, db: Session, rows: list[FileMetricRow]) -> HealthSummary:
+    analysis = db.query(Analysis).filter_by(repo_id=repo_id).first()
+    total_files = analysis.total_files if analysis and analysis.total_files else len(rows)
+    total_commits = analysis.total_commits if analysis else sum(row.commits for row in rows)
+    risk_rows = recalculate_file_risk_scores(rows)
+    high_risk = sum(1 for row in risk_rows if (row.risk_score or 0.0) >= HIGH_RISK_THRESHOLD)
+    return HealthSummary(
+        health_index=compute_health_index(risk_rows),
+        total_files=total_files,
+        total_commits=total_commits,
+        high_risk_files=high_risk,
+    )
+
+
+def _rule_matches(value: str, pattern: str) -> bool:
+    value = value.replace("\\", "/").lower()
+    pattern = pattern.replace("\\", "/").lower().strip("/")
+    if not pattern:
+        return False
+    return value == pattern or value.startswith(f"{pattern}/") or f"/{pattern}/" in value
+
+
+def evaluate_drift_rules(edges: list[DependencyEdge]) -> list[DriftViolation]:
+    rules = [
+        {"id": "api-cannot-import-engine", "source": "api", "target": "engine", "severity": "high"},
+        {"id": "api-cannot-import-models", "source": "api", "target": "models", "severity": "medium"},
+        {"id": "core-cannot-import-api", "source": "core", "target": "api", "severity": "medium"},
+    ]
+    violations: list[DriftViolation] = []
+    seen: set[tuple[str, str, str]] = set()
+    for edge in edges:
+        src = edge.source or ""
+        tgt = edge.target or ""
+        for rule in rules:
+            if _rule_matches(src, rule["source"]) and _rule_matches(tgt, rule["target"]):
+                key = (src, tgt, rule["id"])
+                if key in seen:
+                    continue
+                seen.add(key)
+                violations.append(
+                    DriftViolation(
+                        source=src,
+                        target=tgt,
+                        rule=rule["id"],
+                        severity=rule["severity"],
+                    )
+                )
+    return violations
 
 
 @router.get("/{repo_id}", response_model=AnalysisOut)
@@ -64,33 +111,50 @@ def get_analysis(
     repo_id: int,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
+    limit: int = 10,
+    skip: int = 0,
 ):
-    get_user_repo(db, repo_id, user)
+    repo = get_user_repo(db, repo_id, user)
+    if repo.status != "completed":
+        raise HTTPException(status_code=409, detail=f"Analysis not ready (status: {repo.status})")
+    if limit < 1 or limit > 200:
+        raise HTTPException(status_code=400, detail="limit must be between 1 and 200")
+    if skip < 0:
+        raise HTTPException(status_code=400, detail="skip must be >= 0")
 
-    return AnalysisOut(
-        repo_id=repo_id,
-        summary=HealthSummary(
-            health_index=72.5,
-            total_files=128,
-            total_commits=950,
-            high_risk_files=2,
-        ),
-        risky_files=MOCK_FILES,
-        explanation=(
-            "(mock) engine.py has high complexity and churn; "
-            "consider splitting it."
-        ),
-    )
+    rows = db.query(FileMetricRow).filter_by(repo_id=repo_id).all()
+    risk_rows = recalculate_file_risk_scores(rows)
+    risk_rows = sorted(risk_rows, key=lambda row: (row.risk_score or 0.0, row.path), reverse=True)
+    selected_rows = risk_rows[skip: skip + limit]
+    risky_files = [_serialize_file_metric(row) for row in selected_rows]
+
+    summary = _build_analysis_summary(repo_id, db, rows)
+    explanation = None
+    if risky_files:
+        top_paths = [item.path for item in risky_files[:3]]
+        explanation = "Highest-risk files: " + ", ".join(top_paths) + ". Review the complex and churn-heavy hotspots first."
+    elif rows:
+        explanation = "No files exceeded the high-risk threshold, but dependency and churn hotspots should still be reviewed."
+
+    return AnalysisOut(repo_id=repo_id, summary=summary, risky_files=risky_files, explanation=explanation)
 
 
-@router.get("/{repo_id}/risk", response_model=list[FileMetric])
+@router.get("/{repo_id}/risk", response_model=list[PublicFileMetric])
 def get_risk(
     repo_id: int,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
+    limit: int = 10,
+    skip: int = 0,
 ):
-    get_user_repo(db, repo_id, user)
-    return MOCK_FILES
+    repo = get_user_repo(db, repo_id, user)
+    if repo.status != "completed":
+        raise HTTPException(status_code=409, detail=f"Analysis not ready (status: {repo.status})")
+    if limit < 1 or limit > 200:
+        raise HTTPException(status_code=400, detail="limit must be between 1 and 200")
+    if skip < 0:
+        raise HTTPException(status_code=400, detail="skip must be >= 0")
+    return _build_risk_list(repo_id, db, limit=limit, skip=skip)
 
 
 @router.get("/{repo_id}/dependencies", response_model=DependencyGraph)
@@ -133,19 +197,13 @@ def get_drift(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    get_user_repo(db, repo_id, user)
+    repo = get_user_repo(db, repo_id, user)
+    if repo.status != "completed":
+        raise HTTPException(status_code=409, detail=f"Analysis not ready (status: {repo.status})")
 
-    return DriftReport(
-        repo_id=repo_id,
-        violations=[
-            DriftViolation(
-                source="src/utils/helpers.py",
-                target="src/api/routes.py",
-                rule="utils must not depend on api",
-                severity="high",
-            ),
-        ],
-    )
+    edges = db.query(DependencyEdge).filter_by(repo_id=repo_id).all()
+    violations = evaluate_drift_rules(edges)
+    return DriftReport(repo_id=repo_id, violations=violations)
 
 
 @router.post("/ai-test")

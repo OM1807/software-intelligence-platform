@@ -9,6 +9,7 @@ from app.core.config import settings
 from app.core.database import SessionLocal
 from app.engine import git_miner, parser
 from app.engine.dependency_graph import build_dependency_graph
+from app.engine.risk_calculator import recalculate_file_risk_scores
 from app.models.schema import Analysis, DependencyEdge, FileMetric, Repository
 
 
@@ -83,6 +84,7 @@ def run_analysis(repo_id: int, token: str | None = None) -> None:
         rows = build_file_rows(repo_id, parsed, mined["file_stats"])
         graph = build_dependency_graph(parsed["files"])
         apply_graph_metrics(rows, graph)
+        recalculate_file_risk_scores(rows)
 
         # replace results of any previous run
         db.query(FileMetric).filter_by(repo_id=repo_id).delete()
