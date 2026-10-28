@@ -1,13 +1,16 @@
 import logging
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 from pydantic import BaseModel, Field
 
 from app.api.endpoints.auth import get_current_user
 from app.api.endpoints.repositories import get_user_repo
+from app.core.config import settings
 from app.core.database import get_db
-from app.engine.llm_service import generate_ai_response
+from app.engine.change_impact import analyze_change_impact
+from app.engine.llm_service import generate_ai_response, generate_structured_repo_explanation
+from app.engine.report_generator import build_report
 from app.engine.risk_calculator import HIGH_RISK_THRESHOLD, compute_health_index, recalculate_file_risk_scores
 from app.models.schema import Analysis, DependencyEdge, FileMetric as FileMetricRow, User
 from app.schemas.analysis import (
@@ -15,8 +18,12 @@ from app.schemas.analysis import (
     DependencyGraph,
     DriftReport,
     DriftViolation,
+    EngineeringReport,
     GraphEdge,
     GraphNode,
+    ImpactItem,
+    ImpactReport,
+    ImpactRequest,
 )
 from app.schemas.metrics import FileMetric as PublicFileMetric, HealthSummary
 
@@ -204,6 +211,124 @@ def get_drift(
     edges = db.query(DependencyEdge).filter_by(repo_id=repo_id).all()
     violations = evaluate_drift_rules(edges)
     return DriftReport(repo_id=repo_id, violations=violations)
+
+
+@router.post("/{repo_id}/impact", response_model=ImpactReport)
+def change_impact(
+    repo_id: int,
+    payload: ImpactRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Static impact analysis based on the repository dependency graph."""
+    repo = get_user_repo(db, repo_id, user)
+    if repo.status != "completed":
+        raise HTTPException(status_code=409, detail=f"Analysis not ready (status: {repo.status})")
+
+    if not payload.changed_files:
+        raise HTTPException(status_code=400, detail="changed_files must not be empty")
+
+    rows = db.query(FileMetricRow).filter_by(repo_id=repo_id).all()
+    edges = db.query(DependencyEdge).filter_by(repo_id=repo_id).all()
+    impact = analyze_change_impact(rows, edges, payload.changed_files, depth=payload.depth, limit=payload.limit)
+    return ImpactReport(
+        repo_id=repo_id,
+        changed_files=impact["changed_files"],
+        ignored_files=impact["ignored_files"],
+        impacted_files=[
+            ImpactItem(
+                path=item["path"],
+                depth=item["depth"],
+                relationship=item["relationship"],
+                risk_score=item["risk_score"],
+                centrality=item["centrality"],
+            )
+            for item in impact["impacted_files"]
+        ],
+    )
+
+
+@router.get("/{repo_id}/report", response_model=EngineeringReport)
+def get_report(
+    repo_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+    changed_files: list[str] = Query(default_factory=list),
+    depth: int = Query(default=3, ge=1, le=5),
+    limit: int = Query(default=25, ge=1, le=100),
+    include_ai: bool = Query(default=False),
+):
+    """Generate a deterministic engineering summary from stored analysis and metrics."""
+    repo = get_user_repo(db, repo_id, user)
+    if repo.status != "completed":
+        raise HTTPException(status_code=409, detail=f"Analysis not ready (status: {repo.status})")
+
+    rows = db.query(FileMetricRow).filter_by(repo_id=repo_id).all()
+    edges = db.query(DependencyEdge).filter_by(repo_id=repo_id).all()
+    analysis = db.query(Analysis).filter_by(repo_id=repo_id).first()
+    violations = evaluate_drift_rules(edges)
+    report = build_report(repo, analysis, rows, edges, violations, changed_files=changed_files, depth=depth, limit=limit)
+
+    if include_ai:
+        summary = {
+            "health_index": report.summary.health_index,
+            "total_files": report.summary.total_files,
+            "total_commits": report.summary.total_commits,
+            "high_risk_files": report.summary.high_risk_files,
+            "top_risky_files": [
+                {"path": item.path, "risk_score": item.risk_score} for item in report.highest_risk_files[:5]
+            ],
+            "architecture_violations": [
+                f"{item.source} -> {item.target} ({item.rule})" for item in report.architecture_violations
+            ],
+            "impact": [
+                f"{item.path} (depth={item.depth})" for item in report.impact.impacted_files
+            ] if report.impact else [],
+        }
+        explanation = generate_structured_repo_explanation(summary)
+        report.ai_explanation = explanation
+        report.llm_available = bool(settings.LLM_API_KEY)
+    else:
+        report.ai_explanation = None
+        report.llm_available = bool(settings.LLM_API_KEY)
+
+    return report
+
+
+@router.post("/{repo_id}/ai-explain")
+def explain_repo_summary(
+    repo_id: int,
+    payload: ImpactRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Optional repository-specific AI explanation using only bounded structured facts."""
+    repo = get_user_repo(db, repo_id, user)
+    if repo.status != "completed":
+        raise HTTPException(status_code=409, detail=f"Analysis not ready (status: {repo.status})")
+
+    rows = db.query(FileMetricRow).filter_by(repo_id=repo_id).all()
+    edges = db.query(DependencyEdge).filter_by(repo_id=repo_id).all()
+    analysis = db.query(Analysis).filter_by(repo_id=repo_id).first()
+    violations = evaluate_drift_rules(edges)
+    report = build_report(repo, analysis, rows, edges, violations, changed_files=payload.changed_files, depth=payload.depth, limit=payload.limit)
+    summary = {
+        "health_index": report.summary.health_index,
+        "total_files": report.summary.total_files,
+        "total_commits": report.summary.total_commits,
+        "high_risk_files": report.summary.high_risk_files,
+        "top_risky_files": [
+            {"path": item.path, "risk_score": item.risk_score} for item in report.highest_risk_files[:5]
+        ],
+        "architecture_violations": [
+            f"{item.source} -> {item.target} ({item.rule})" for item in report.architecture_violations
+        ],
+        "impact": [f"{item.path} (depth={item.depth})" for item in report.impact.impacted_files] if report.impact else [],
+    }
+    llm_explanation = generate_structured_repo_explanation(summary)
+    if llm_explanation is None:
+        raise HTTPException(status_code=503, detail="Optional AI explanation is unavailable because no API key is configured.")
+    return {"repo_id": repo_id, "explanation": llm_explanation}
 
 
 @router.post("/ai-test")

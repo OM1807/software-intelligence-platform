@@ -41,6 +41,26 @@ Run the backend tests from the `backend/` directory:
 python -m pytest -q
 ```
 
+## Phase 2 change-impact and reporting
+
+The backend now includes:
+
+- `POST /analysis/{repo_id}/impact` for dependency-based impact analysis using reverse traversal on the persisted graph.
+- `GET /analysis/{repo_id}/report` for a deterministic engineering report assembled from persisted metrics, graph stats, cycles, and architecture violations.
+- `POST /analysis/{repo_id}/ai-explain` for an advisory optional AI explanation generated from a bounded structured summary only when an LLM key is configured.
+
+Example payload for impact analysis:
+
+```json
+{
+  "changed_files": ["src/core/service.py"],
+  "depth": 2,
+  "limit": 25
+}
+```
+
+The report schema includes repository metadata, summary health metrics, top-risk files, cycle and dependency stats, architecture violations, impact results, and deterministic recommendations. If no LLM key is configured, the report still functions and the AI section is omitted gracefully.
+
 ## Tech Stack
 
 - **Frontend:** React, TypeScript
