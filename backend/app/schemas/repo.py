@@ -17,4 +17,5 @@ class RepoOut(BaseModel):
     url: str
     is_private: bool
     status: str
+    error: str | None = None
     last_analyzed: datetime | None = None

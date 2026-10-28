@@ -26,7 +26,7 @@ def clone_repo(owner: str, name: str, dest_name: str, token: str | None = None) 
     auth = f"x-access-token:{token}@" if token else ""
     url = f"https://{auth}github.com/{owner}/{name}.git"
     try:
-        repo = Repo.clone_from(url, dest)
+        repo = Repo.clone_from(url, dest, env={"GIT_TERMINAL_PROMPT": "0"})
     except GitCommandError as e:
         shutil.rmtree(dest, ignore_errors=True)
         # never leak the token in error messages
