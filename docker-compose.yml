@@ -1,3 +1,4 @@
+
 version: '3.8'
 
 services:
@@ -15,7 +16,7 @@ services:
       - postgres_data:/var/lib/postgresql/data
 
   backend:
-    build: 
+    build:
       context: ./backend
     container_name: sip_backend
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
@@ -25,6 +26,8 @@ services:
       - "8000:8000"
     depends_on:
       - db
+    env_file:
+      - ./backend/.env
     environment:
       - DATABASE_URL=postgresql://sip_user:sip_password@db:5432/sip_database
 
