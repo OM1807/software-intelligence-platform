@@ -1,4 +1,3 @@
-
 import logging
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -9,7 +8,7 @@ from app.api.endpoints.auth import get_current_user
 from app.api.endpoints.repositories import get_user_repo
 from app.core.database import get_db
 from app.engine.llm_service import generate_ai_response
-from app.models.schema import User
+from app.models.schema import Analysis, DependencyEdge, FileMetric as FileMetricRow, User
 from app.schemas.analysis import (
     AnalysisOut,
     DependencyGraph,
@@ -97,28 +96,35 @@ def get_risk(
 @router.get("/{repo_id}/dependencies", response_model=DependencyGraph)
 def get_dependencies(
     repo_id: int,
+    include_isolated: bool = True,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    get_user_repo(db, repo_id, user)
+    repo = get_user_repo(db, repo_id, user)
+    if repo.status != "completed":
+        raise HTTPException(status_code=409, detail=f"Analysis not ready (status: {repo.status})")
 
-    nodes = [
-        GraphNode(id=file.path, label=file.path.split("/")[-1])
-        for file in MOCK_FILES
-    ]
+    files = db.query(FileMetricRow).filter_by(repo_id=repo_id).all()
+    edges = db.query(DependencyEdge).filter_by(repo_id=repo_id).all()
+    analysis = db.query(Analysis).filter_by(repo_id=repo_id).first()
 
-    edges = [
-        GraphEdge(
-            source="src/api/routes.py",
-            target="src/core/engine.py",
-        ),
-        GraphEdge(
-            source="src/core/engine.py",
-            target="src/utils/helpers.py",
-        ),
-    ]
+    if not include_isolated:  # hide files with no dependencies at all (less clutter in the graph view)
+        connected = {e.source for e in edges} | {e.target for e in edges}
+        files = [f for f in files if f.path in connected]
 
-    return DependencyGraph(nodes=nodes, edges=edges)
+    return DependencyGraph(
+        nodes=[
+            GraphNode(
+                id=f.path, label=f.path.split("/")[-1], language=f.language, loc=f.loc,
+                fan_in=f.fan_in, fan_out=f.fan_out, centrality=f.centrality,
+                instability=f.instability, in_cycle=f.in_cycle,
+            )
+            for f in files
+        ],
+        edges=[GraphEdge(source=e.source, target=e.target, weight=e.weight) for e in edges],
+        cycles=analysis.cycles if analysis else [],
+        stats=analysis.graph_stats if analysis else {},
+    )
 
 
 @router.get("/{repo_id}/drift", response_model=DriftReport)
@@ -177,5 +183,3 @@ def test_gemini(
                 "verify API key, model availability, and configuration."
             ),
         )
-
-

@@ -1,4 +1,4 @@
-"""Import pipeline: clone -> mine git history -> parse code -> store results."""
+"""Import pipeline: clone -> mine git history -> parse code -> build dependency graph -> store results."""
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
@@ -8,7 +8,8 @@ import httpx
 from app.core.config import settings
 from app.core.database import SessionLocal
 from app.engine import git_miner, parser
-from app.models.schema import Analysis, FileMetric, Repository
+from app.engine.dependency_graph import build_dependency_graph
+from app.models.schema import Analysis, DependencyEdge, FileMetric, Repository
 
 
 def _parse_date(value: str | None) -> datetime | None:
@@ -56,6 +57,16 @@ def build_file_rows(repo_id: int, parsed: dict, git_stats: dict) -> list[FileMet
     return rows
 
 
+def apply_graph_metrics(rows: list[FileMetric], graph: dict) -> None:
+    """Copy fan-in/out, centrality, instability and cycle flag onto each file row."""
+    for row in rows:
+        m = graph["metrics"].get(row.path)
+        if m:
+            row.fan_in, row.fan_out = m["fan_in"], m["fan_out"]
+            row.centrality, row.instability = m["centrality"], m["instability"]
+            row.in_cycle = m["in_cycle"]
+
+
 def run_analysis(repo_id: int, token: str | None = None) -> None:
     """Runs in a background task. Always leaves the repo as 'completed' or 'failed'."""
     db = SessionLocal()
@@ -70,17 +81,24 @@ def run_analysis(repo_id: int, token: str | None = None) -> None:
         mined = git_miner.mine_repository(repo.owner, repo.name, f"repo_{repo_id}", token)
         parsed = parser.parse_repository(mined["path"])
         rows = build_file_rows(repo_id, parsed, mined["file_stats"])
+        graph = build_dependency_graph(parsed["files"])
+        apply_graph_metrics(rows, graph)
 
         # replace results of any previous run
         db.query(FileMetric).filter_by(repo_id=repo_id).delete()
         db.query(Analysis).filter_by(repo_id=repo_id).delete()
+        db.query(DependencyEdge).filter_by(repo_id=repo_id).delete()
         db.add_all(rows)
+        db.add_all(DependencyEdge(repo_id=repo_id, source=s_, target=t_, weight=w)
+                   for s_, t_, w in graph["edges"])
         db.add(Analysis(
             repo_id=repo_id,
             total_commits=mined["total_commits"],
             contributors=mined["contributors"],
             total_files=len(rows),
             timeline=mined["timeline"],
+            cycles=graph["cycles"],
+            graph_stats=graph["stats"],
         ))
         repo.status = "completed"
         repo.error = None

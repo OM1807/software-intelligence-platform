@@ -48,6 +48,8 @@ class Analysis(Base):
     contributors: Mapped[int] = mapped_column(Integer, default=0)
     total_files: Mapped[int] = mapped_column(Integer, default=0)
     timeline: Mapped[list] = mapped_column(JSON, default=list)  # [{"date": "2026-07", "commits": 12}]
+    cycles: Mapped[list] = mapped_column(JSON, default=list)  # [[path, path, ...], ...] circular dependency groups
+    graph_stats: Mapped[dict] = mapped_column(JSON, default=dict)  # {"nodes", "edges", "cycles", ...}
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
@@ -70,6 +72,23 @@ class FileMetric(Base):
     authors: Mapped[int] = mapped_column(Integer, default=0)
     last_modified: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     parse_errors: Mapped[bool] = mapped_column(Boolean, default=False)
+    # dependency-graph metrics (Phase 3)
+    fan_in: Mapped[int] = mapped_column(Integer, default=0)  # files that import this file
+    fan_out: Mapped[int] = mapped_column(Integer, default=0)  # files this file imports
+    centrality: Mapped[float] = mapped_column(Float, default=0)  # 0..1 PageRank, 1 = most central
+    instability: Mapped[float] = mapped_column(Float, default=0)  # fan_out / (fan_in + fan_out)
+    in_cycle: Mapped[bool] = mapped_column(Boolean, default=False)
     risk_score: Mapped[float | None] = mapped_column(Float, nullable=True)
     # {"functions": [...], "classes": [...], "imports": [...]} straight from parser.py
     structure: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class DependencyEdge(Base):
+    """One 'source imports target' relation between two files of a repo."""
+    __tablename__ = "dependency_edges"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    repo_id: Mapped[int] = mapped_column(ForeignKey("repositories.id", ondelete="CASCADE"), index=True)
+    source: Mapped[str] = mapped_column(String(1000))
+    target: Mapped[str] = mapped_column(String(1000))
+    weight: Mapped[int] = mapped_column(Integer, default=1)  # number of import statements
