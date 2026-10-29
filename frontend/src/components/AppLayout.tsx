@@ -1,6 +1,7 @@
 import { NavLink, useLocation, useNavigate } from 'react-router-dom';
 import { useRepos } from '@/context/RepoContext';
-import { Activity, ArrowLeft, Blocks, GitBranch, GitCompareArrows, LayoutDashboard, Network, ShieldAlert } from 'lucide-react';
+import { clearToken } from '@/api';
+import { Activity, ArrowLeft, Blocks, FileText, GitBranch, GitCompareArrows, LayoutDashboard, Network, ShieldAlert } from 'lucide-react';
 
 const navItems = [
   { to: '/dashboard', label: 'Overview', icon: LayoutDashboard },
@@ -8,6 +9,7 @@ const navItems = [
   { to: '/risk', label: 'Risk Analysis', icon: ShieldAlert },
   { to: '/impact', label: 'Change Impact', icon: GitCompareArrows },
   { to: '/drift', label: 'Architecture Drift', icon: Blocks },
+  { to: '/report', label: 'Engineering Report', icon: FileText },
 ];
 
 function Sidebar() {
@@ -73,10 +75,10 @@ function Sidebar() {
 
       <div className="border-t p-4">
         <div className="rounded-xl bg-slate-50 p-3">
-          <p className="flex items-center gap-2 text-xs font-semibold text-slate-700"><Activity size={15} aria-hidden="true" /> Prototype workspace</p>
-          <p className="mt-1.5 text-xs leading-relaxed text-slate-500">Explore insights with sample repository data.</p>
+          <p className="flex items-center gap-2 text-xs font-semibold text-slate-700"><Activity size={15} aria-hidden="true" /> Connected workspace</p>
+          <p className="mt-1.5 text-xs leading-relaxed text-slate-500">Explore insights generated from your repository.</p>
         </div>
-        <NavLink to="/" className="mt-3 flex items-center gap-2 rounded-lg px-3 py-2 text-xs font-medium text-slate-600 hover:bg-slate-50"><ArrowLeft size={14} aria-hidden="true" /> Back to sign in</NavLink>
+        <button onClick={() => { clearToken(); navigate('/'); }} className="mt-3 flex items-center gap-2 rounded-lg px-3 py-2 text-xs font-medium text-slate-600 hover:bg-slate-50"><ArrowLeft size={14} aria-hidden="true" /> Sign out</button>
       </div>
     </aside>
   );
@@ -123,7 +125,7 @@ export default function AppLayout({ children }: { children: React.ReactNode }) {
       <div className="flex min-w-0 flex-1 flex-col overflow-hidden">
         <header className="flex min-h-16 shrink-0 flex-wrap items-center justify-between gap-2 border-b bg-white/90 px-5 py-3 sm:px-8">
           <p className="text-xs font-medium text-slate-500">Software Intelligence <span className="mx-2 text-slate-300">/</span><span className="text-slate-800">Workspace</span></p>
-          <span className="badge"><span className="h-1.5 w-1.5 rounded-full bg-blue-500" /> Sample data</span>
+          <span className="badge"><span className="h-1.5 w-1.5 rounded-full bg-emerald-500" /> Backend connected</span>
         </header>
         <MobileNav />
         <main className="flex-1 overflow-y-auto">{children}</main>

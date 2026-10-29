@@ -9,6 +9,7 @@ import DependencyView from '@/pages/DependencyView';
 import RiskAnalysis from '@/pages/RiskAnalysis';
 import ChangeImpact from '@/pages/ChangeImpact';
 import ArchitectureDrift from '@/pages/ArchitectureDrift';
+import EngineeringReport from '@/pages/EngineeringReport';
 
 function RouteScrollReset() {
   const { pathname } = useLocation();
@@ -23,6 +24,7 @@ function App() {
       <RepoProvider>
         <Routes>
           <Route path="/" element={<Login />} />
+          <Route path="/login" element={<Login />} />
           <Route path="/auth/github/callback" element={<Login />} />
           <Route path="/repositories" element={<RepoConnect />} />
           <Route element={<AppLayoutRoute />}>
@@ -31,6 +33,7 @@ function App() {
             <Route path="/risk" element={<RiskAnalysis />} />
             <Route path="/impact" element={<ChangeImpact />} />
             <Route path="/drift" element={<ArchitectureDrift />} />
+            <Route path="/report" element={<EngineeringReport />} />
           </Route>
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>

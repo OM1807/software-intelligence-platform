@@ -1,83 +1,25 @@
-import { Pie } from 'react-chartjs-2';
-import {
-  Chart as ChartJS,
-  ArcElement,
-  Tooltip,
-  Legend,
-} from 'chart.js';
+import { useState } from 'react';
+import { api, type ImpactReport } from '@/api';
 import { PageContainer, PageHeader } from '@/components/Page';
-import { impactFiles } from '@/data/mockData';
-
-ChartJS.register(ArcElement, Tooltip, Legend);
-
-const palette = [
-  '#2563eb',
-  '#0ea5e9',
-  '#14b8a6',
-  '#f59e0b',
-  '#a855f7',
-  '#64748b',
-];
+import { useRepos } from '@/context/RepoContext';
 
 export default function ChangeImpact() {
-  const data = {
-    labels: impactFiles.map((f) => f.file),
-    datasets: [
-      {
-        data: impactFiles.map((f) => f.impact),
-        backgroundColor: palette,
-        borderColor: '#ffffff',
-        borderWidth: 2,
-      },
-    ],
-  };
-
-  const options = {
-    responsive: true,
-    maintainAspectRatio: false,
-    plugins: {
-      legend: {
-        position: 'right' as const,
-        labels: { color: '#475569', font: { size: 12 }, boxWidth: 12 },
-      },
-    },
-  };
-
-  return (
-    <PageContainer>
-      <PageHeader
-        title="Change Impact"
-        description="Files most affected by recent commits, ranked by impact score."
-      />
-
-      <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
-        <div className="card h-[360px]">
-          <Pie data={data} options={options} />
-        </div>
-
-        <div className="card">
-          <h2 className="mb-4 text-sm font-semibold text-slate-700">
-            Most affected files
-          </h2>
-          <ul className="space-y-3">
-            {impactFiles.map((f, i) => (
-              <li key={f.file} className="flex items-center gap-3">
-                <span
-                  className="h-2.5 w-2.5 shrink-0 rounded-full"
-                  style={{ background: palette[i % palette.length] }}
-                />
-                <span className="flex-1 truncate text-sm text-slate-700">
-                  {f.file}
-                </span>
-                <span className="text-xs text-slate-400">{f.commits} commits</span>
-                <span className="w-10 text-right text-sm font-medium text-slate-900">
-                  {f.impact}
-                </span>
-              </li>
-            ))}
-          </ul>
-        </div>
-      </div>
-    </PageContainer>
-  );
+  const { activeRepo } = useRepos();
+  const [files, setFiles] = useState('');
+  const [report, setReport] = useState<ImpactReport | null>(null);
+  const [error, setError] = useState('');
+  async function submit(event: React.FormEvent) {
+    event.preventDefault();
+    if (!activeRepo) return;
+    try {
+      setError('');
+      setReport(await api.impact(activeRepo.id, files.split(/\r?\n|,/).map((file) => file.trim()).filter(Boolean)));
+    } catch (cause) { setError(cause instanceof Error ? cause.message : 'Unable to calculate change impact.'); }
+  }
+  return <PageContainer>
+    <PageHeader title="Change Impact" description="Find files affected by changed files in the repository dependency graph." />
+    <form onSubmit={submit} className="card mb-6 space-y-3"><label htmlFor="changed-files" className="block text-sm font-medium text-slate-700">Changed files (one per line)</label><textarea id="changed-files" required value={files} onChange={(event) => setFiles(event.target.value)} className="input min-h-24" placeholder="src/api/routes.py" /><button className="btn-primary" type="submit">Calculate impact</button></form>
+    {error && <p role="alert" className="mb-4 rounded-lg bg-red-50 p-3 text-sm text-red-800">{error}</p>}
+    {report && <div className="card"><h2 className="mb-4 text-sm font-semibold text-slate-700">Impacted files</h2>{report.impacted_files.length ? <ul className="space-y-3">{report.impacted_files.map((file) => <li key={file.path} className="flex justify-between text-sm"><span>{file.path}</span><span className="text-slate-500">depth {file.depth} · risk {(file.risk_score * 100).toFixed(0)}</span></li>)}</ul> : <p className="text-sm text-slate-500">No impacted files found.</p>}</div>}
+  </PageContainer>;
 }

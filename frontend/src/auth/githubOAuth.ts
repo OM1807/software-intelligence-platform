@@ -12,7 +12,7 @@ function base64url(bytes: Uint8Array): string {
 }
 
 export function validateConfig(config: GitHubConfig): URL {
-  if (!config.clientId.trim()) throw new Error('GitHub sign-in is not configured yet. You can explore the demo below.');
+  if (!config.clientId.trim()) throw new Error('GitHub sign-in is not configured yet.');
   let redirect: URL;
   try { redirect = new URL(config.redirectUri); }
   catch { throw new Error('The GitHub callback URL is not configured correctly.'); }
