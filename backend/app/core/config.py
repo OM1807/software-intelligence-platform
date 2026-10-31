@@ -1,6 +1,12 @@
-﻿from pathlib import Path
+import os
+import tempfile
+from pathlib import Path
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+def _default_repos_dir() -> str:
+    return os.path.join(tempfile.gettempdir(), "sip_repos")
 
 
 class Settings(BaseSettings):
@@ -25,7 +31,7 @@ class Settings(BaseSettings):
     BACKEND_URL: str = "http://localhost:8000"
 
     LLM_API_KEY: str = ""
-    REPOS_DIR: str = "/tmp/sip_repos"
+    REPOS_DIR: str = _default_repos_dir()
 
     @property
     def is_production(self) -> bool:

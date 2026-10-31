@@ -10,11 +10,17 @@ import RiskAnalysis from '@/pages/RiskAnalysis';
 import ChangeImpact from '@/pages/ChangeImpact';
 import ArchitectureDrift from '@/pages/ArchitectureDrift';
 import EngineeringReport from '@/pages/EngineeringReport';
+import AIAssistant from '@/pages/AIAssistant';
+import { getToken } from '@/api';
 
 function RouteScrollReset() {
   const { pathname } = useLocation();
   useEffect(() => { window.scrollTo(0, 0); }, [pathname]);
   return null;
+}
+
+function ProtectedRoute({ children }: { children: React.ReactNode }) {
+  return getToken() ? children : <Navigate to="/login" replace />;
 }
 
 function App() {
@@ -26,7 +32,7 @@ function App() {
           <Route path="/" element={<Login />} />
           <Route path="/login" element={<Login />} />
           <Route path="/auth/github/callback" element={<Login />} />
-          <Route path="/repositories" element={<RepoConnect />} />
+          <Route path="/repositories" element={<ProtectedRoute><RepoConnect /></ProtectedRoute>} />
           <Route element={<AppLayoutRoute />}>
             <Route path="/dashboard" element={<Dashboard />} />
             <Route path="/dependencies" element={<DependencyView />} />
@@ -34,6 +40,7 @@ function App() {
             <Route path="/impact" element={<ChangeImpact />} />
             <Route path="/drift" element={<ArchitectureDrift />} />
             <Route path="/report" element={<EngineeringReport />} />
+            <Route path="/assistant" element={<AIAssistant />} />
           </Route>
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>

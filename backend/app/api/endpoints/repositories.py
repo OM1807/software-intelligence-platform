@@ -1,6 +1,7 @@
-﻿import re
+import re
 from urllib.parse import urlparse
 
+import httpx
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from sqlalchemy.orm import Session
 
@@ -50,6 +51,24 @@ def get_user_repo(db: Session, repo_id: int, user: User) -> Repository:
     return repo
 
 
+def _verify_github_access(owner: str, name: str, token: str | None) -> bool:
+    if not token:
+        raise HTTPException(status_code=401, detail="A GitHub sign-in is required before importing repositories")
+    try:
+        response = httpx.get(
+            f"https://api.github.com/repos/{owner}/{name}",
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"},
+            timeout=15,
+        )
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail="GitHub could not be reached to verify repository access") from exc
+    if response.status_code in {401, 403, 404}:
+        raise HTTPException(status_code=403, detail="Your GitHub account does not have access to this repository")
+    if response.status_code != 200:
+        raise HTTPException(status_code=502, detail="GitHub rejected repository access verification")
+    return bool(response.json().get("private"))
+
+
 @router.post("/import", response_model=RepoOut)
 def import_repository(
     body: RepoImport,
@@ -57,23 +76,41 @@ def import_repository(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    owner, name = _parse_github_repo(body.url)
+    url_val = (body.url or "").strip()
+    owner, name = _parse_github_repo(url_val)
+    url = f"https://github.com/{owner}/{name}"
+    is_private = _verify_github_access(owner, name, user.github_token)
 
     repo = db.query(Repository).filter_by(user_id=user.id, owner=owner, name=name).first()
     if not repo:
-        repo = Repository(user_id=user.id, owner=owner, name=name,
-                          url=f"https://github.com/{owner}/{name}")
+        repo = Repository(user_id=user.id, owner=owner, name=name, url=url, is_private=is_private)
         db.add(repo)
     elif repo.status == "processing":
         return repo
 
     repo.status = "processing"
     repo.error = None
+    repo.is_private = is_private
     db.commit()
     db.refresh(repo)
 
-    token = body.access_token or user.github_token
-    background.add_task(run_analysis, repo.id, token)
+    background.add_task(run_analysis, repo.id, user.github_token)
+    return repo
+
+
+@router.post("/{repo_id}/reanalyze", response_model=RepoOut)
+def reanalyze_repository(
+    repo_id: int,
+    background: BackgroundTasks,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    repo = get_user_repo(db, repo_id, user)
+    repo.status = "processing"
+    repo.error = None
+    db.commit()
+    db.refresh(repo)
+    background.add_task(run_analysis, repo.id, user.github_token)
     return repo
 
 
@@ -89,5 +126,6 @@ def get_repository(repo_id: int, db: Session = Depends(get_db), user: User = Dep
 
 @router.delete("/{repo_id}", status_code=204)
 def delete_repository(repo_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    db.delete(get_user_repo(db, repo_id, user))
+    repo = get_user_repo(db, repo_id, user)
+    db.delete(repo)
     db.commit()

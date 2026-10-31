@@ -4,6 +4,21 @@ from collections import defaultdict, deque
 from typing import Iterable, Sequence
 
 
+def _find_matching_path(candidate: str, file_paths: set[str]) -> str | None:
+    norm = candidate.replace("\\", "/").strip().lstrip("/")
+    if not norm:
+        return None
+    # 1. Exact match
+    if norm in file_paths:
+        return norm
+    # 2. Suffix match (e.g. "api.ts" -> "frontend/src/api.ts" or "core/database.py" -> "backend/app/core/database.py")
+    matching = [p for p in file_paths if p.endswith("/" + norm) or p.endswith(norm)]
+    if matching:
+        # Return shortest/closest match deterministically
+        return sorted(matching, key=lambda p: (len(p), p))[0]
+    return None
+
+
 def analyze_change_impact(
     file_metrics: Sequence[object],
     dependency_edges: Iterable[object],
@@ -43,16 +58,17 @@ def analyze_change_impact(
         if source and target:
             reverse[target].append(source)
 
-    cleaned_changed = []
+    cleaned_changed: list[str] = []
     ignored: list[str] = []
     for candidate in changed_files:
-        path = str(candidate).strip()
-        if not path:
+        cand_str = str(candidate).strip()
+        if not cand_str:
             continue
-        if path in file_paths:
-            cleaned_changed.append(path)
+        matched = _find_matching_path(cand_str, file_paths)
+        if matched:
+            cleaned_changed.append(matched)
         else:
-            ignored.append(path)
+            ignored.append(cand_str)
 
     cleaned_changed = list(dict.fromkeys(cleaned_changed))
     if not cleaned_changed:
@@ -75,20 +91,21 @@ def analyze_change_impact(
                 queue.append((dependent, next_depth))
 
     impacted = []
-    for path, depth in seen.items():
+    for path, d in seen.items():
         if path in cleaned_changed:
             continue
         impacted.append(
             {
                 "path": path,
-                "depth": depth,
-                "relationship": "direct" if depth == 1 else "transitive",
+                "depth": d,
+                "relationship": "direct" if d == 1 else "transitive",
                 "risk_score": risk_by_path.get(path, 0.0),
                 "centrality": centrality_by_path.get(path, 0.0),
             }
         )
 
-    impacted.sort(key=lambda item: (-int(item["depth"]), -float(item["risk_score"]), item["path"]))
+    # Sort impacted files: deepest / highest risk first
+    impacted.sort(key=lambda item: (int(item["depth"]), -float(item["risk_score"]), item["path"]))
     return {
         "changed_files": cleaned_changed,
         "ignored_files": ignored,

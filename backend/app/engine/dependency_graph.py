@@ -9,9 +9,6 @@ Output: build_dependency_graph(files) -> {
 }
 
 Edge direction: A -> B means "A imports B", so B's fan_in = number of files that depend on B.
-
-To add a language (e.g. Java): write a resolver class with __init__(paths) and
-resolve(src_path, imp) -> list[str], then register it in RESOLVERS.
 """
 import posixpath
 from collections import defaultdict
@@ -23,10 +20,7 @@ MAX_CYCLES_STORED = 50
 
 # ======================= Python import resolver =======================
 class PythonResolver:
-    """Maps import statements to .py files that exist inside the repo.
-
-    Imports of anything not in the repo (os, requests, ...) resolve to nothing and are ignored.
-    """
+    """Maps import statements to .py files that exist inside the repo."""
 
     def __init__(self, paths: list[str]):
         self.paths = set(paths)
@@ -34,60 +28,41 @@ class PythonResolver:
         self._index(sorted(paths))
 
     def _index(self, paths: list[str]) -> None:
-        primary: dict[str, str] = {}
-        aliases: dict[str, str] = {}
         for path in paths:
             parts = path.split("/")
             dirs, filename = parts[:-1], parts[-1]
             is_init = filename == "__init__.py"
-            stem = filename[:-3]
-
-            # primary name: walk up while the parent dir is a package (has __init__.py)
-            i = len(dirs)
-            while i > 0 and "/".join(dirs[:i] + ["__init__.py"]) in self.paths:
-                i -= 1
-            primary_parts = dirs[i:] + ([] if is_init else [stem])
-            # alias: path from the repo root, so "src.pkg.mod" style imports also resolve
-            alias_parts = dirs + ([] if is_init else [stem])
-
-            for name_parts, table in ((primary_parts, primary), (alias_parts, aliases)):
-                if not name_parts:
-                    continue
-                name = ".".join(name_parts)
-                # on a name clash keep the shallowest file (deterministic)
-                if name not in table or path.count("/") < table[name].count("/"):
-                    table[name] = path
-
-        self.module_to_path = {**aliases, **primary}  # primary names win over aliases
+            stem = filename[:-3] if filename.endswith(".py") else filename
+            full_parts = dirs + ([] if is_init else [stem])
+            # Index all suffix forms: e.g. for backend/app/engine/parser.py:
+            # - backend.app.engine.parser
+            # - app.engine.parser
+            # - engine.parser
+            # - parser
+            for i in range(len(full_parts)):
+                dotted = ".".join(full_parts[i:])
+                if dotted not in self.module_to_path or len(path) < len(self.module_to_path[dotted]):
+                    self.module_to_path[dotted] = path
 
     def _file_for(self, parts: list[str]) -> str | None:
-        """Filesystem lookup used by relative imports: <parts>.py or <parts>/__init__.py."""
         base = "/".join(parts)
         for candidate in ([f"{base}.py"] if parts else []) + [posixpath.join(base, "__init__.py")]:
             if candidate in self.paths:
                 return candidate
         return None
 
-    def _lookup(self, dotted: str) -> str | None:
-        """Longest-prefix match: 'a.b.c' -> a.b.c, else a.b, else a."""
-        parts = dotted.split(".")
-        while parts:
-            hit = self.module_to_path.get(".".join(parts))
-            if hit:
-                return hit
-            parts.pop()
-        return None
-
     def resolve(self, src_path: str, imp: dict) -> list[str]:
-        module, names, level = imp["module"], imp["names"], imp["level"]
+        module = imp.get("module", "")
+        names = imp.get("names", [])
+        level = imp.get("level", 0)
         real_names = [n for n in names if n != "*"]
 
-        if level:  # relative import: resolved from the importing file's folder
+        if level > 0:
             base = src_path.split("/")[:-1]
             up = level - 1
             if up > len(base):
                 return []
-            if up:
+            if up > 0:
                 base = base[:-up]
             pkg_dir = base + (module.split(".") if module else [])
             hits = [h for n in real_names if (h := self._file_for(pkg_dir + [n]))]
@@ -95,25 +70,112 @@ class PythonResolver:
                 hits = [h]
             return hits
 
-        # absolute import
-        if not module:
+        # Absolute import (level == 0)
+        # 1. from pkg import mod where mod is mod.py inside pkg
+        hits = []
+        for n in real_names:
+            sub = f"{module}.{n}" if module else n
+            if sub in self.module_to_path:
+                hits.append(self.module_to_path[sub])
+        if hits:
+            return hits
+
+        # 2. from pkg.mod import func or import pkg.mod
+        if module in self.module_to_path:
+            return [self.module_to_path[module]]
+
+        # 3. Fallback: longest matching dotted prefix
+        parts = module.split(".")
+        while parts:
+            hit = self.module_to_path.get(".".join(parts))
+            if hit:
+                return [hit]
+            parts.pop()
+
+        return []
+
+
+# ======================= JS / TS import resolver =======================
+class JavaScriptResolver:
+    """Maps import / require statements in JS/TS to repo files."""
+
+    def __init__(self, paths: list[str]):
+        self.paths = set(paths)
+        self.src_prefixes = set()
+        for p in paths:
+            if "src/" in p:
+                self.src_prefixes.add(p.split("src/")[0] + "src/")
+
+    def resolve(self, src_path: str, imp: dict) -> list[str]:
+        mod = imp.get("module", "").strip()
+        if not mod:
             return []
-        # "from pkg import mod" -> mod may be a submodule file
-        hits = [h for n in real_names if (h := self.module_to_path.get(f"{module}.{n}"))]
-        if not hits and (h := self._lookup(module)):
-            hits = [h]
-        return hits
+
+        candidates = []
+        if mod.startswith("."):
+            curr_dir = posixpath.dirname(src_path)
+            candidates.append(posixpath.normpath(posixpath.join(curr_dir, mod)))
+        elif mod.startswith("@/") or mod.startswith("~/"):
+            rel = mod[2:]
+            if "src/" in src_path:
+                prefix = src_path.split("src/")[0] + "src/"
+                candidates.append(posixpath.normpath(posixpath.join(prefix, rel)))
+            for prefix in self.src_prefixes:
+                candidates.append(posixpath.normpath(posixpath.join(prefix, rel)))
+            candidates.append(posixpath.normpath(posixpath.join("src", rel)))
+            candidates.append(rel)
+        else:
+            curr_dir = posixpath.dirname(src_path)
+            candidates.append(posixpath.normpath(posixpath.join(curr_dir, mod)))
+            if "src/" in src_path:
+                prefix = src_path.split("src/")[0] + "src/"
+                candidates.append(posixpath.normpath(posixpath.join(prefix, mod)))
+            candidates.append(mod)
+
+        extensions = ["", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", "/index.ts", "/index.tsx", "/index.js", "/index.jsx"]
+        for cand in candidates:
+            for ext in extensions:
+                target = cand + ext
+                if target in self.paths:
+                    return [target]
+        return []
 
 
-RESOLVERS = {"python": PythonResolver}
+# ======================= Java import resolver =======================
+class JavaResolver:
+    """Maps Java import statements to repo files."""
+
+    def __init__(self, paths: list[str]):
+        self.paths = set(paths)
+        self.stem_map: dict[str, list[str]] = defaultdict(list)
+        for p in paths:
+            stem = posixpath.splitext(posixpath.basename(p))[0]
+            self.stem_map[stem].append(p)
+
+    def resolve(self, src_path: str, imp: dict) -> list[str]:
+        mod = imp.get("module", "").strip()
+        if not mod:
+            return []
+        as_path = mod.replace(".", "/") + ".java"
+        for p in self.paths:
+            if p.endswith(as_path):
+                return [p]
+        simple_name = mod.split(".")[-1]
+        matches = self.stem_map.get(simple_name, [])
+        return matches[:1]
+
+
+RESOLVERS = {
+    "python": PythonResolver,
+    "typescript": JavaScriptResolver,
+    "javascript": JavaScriptResolver,
+    "java": JavaResolver,
+}
 
 
 # ======================= Graph metrics =======================
 def _pagerank(G: nx.DiGraph, damping: float = 0.85, iters: int = 100, tol: float = 1e-8) -> dict[str, float]:
-    """Plain power-iteration PageRank (avoids a SciPy dependency).
-
-    An edge A -> B passes importance to B, so files that many important files import score high.
-    """
+    """Plain power-iteration PageRank."""
     nodes = list(G)
     n = len(nodes)
     if n == 0:
@@ -139,26 +201,31 @@ def build_dependency_graph(files: list[dict]) -> dict:
     G = nx.DiGraph()
     G.add_nodes_from(f["path"] for f in files)
 
-    # one resolver per language, each only knows files of its own language
+    # For JS/TS, share all JS/TS files
     paths_by_lang: dict[str, list[str]] = defaultdict(list)
     for f in files:
-        paths_by_lang[f["language"]].append(f["path"])
+        lang = f["language"]
+        if lang in ("typescript", "javascript"):
+            paths_by_lang["typescript"].append(f["path"])
+            paths_by_lang["javascript"].append(f["path"])
+        else:
+            paths_by_lang[lang].append(f["path"])
+
     resolvers = {lang: RESOLVERS[lang](paths) for lang, paths in paths_by_lang.items() if lang in RESOLVERS}
 
     for f in files:
         resolver = resolvers.get(f["language"])
         if resolver is None:
             continue
-        for imp in f["imports"]:
+        for imp in f.get("imports", []):
             for target in resolver.resolve(f["path"], imp):
                 if target == f["path"]:
                     continue
                 if G.has_edge(f["path"], target):
-                    G[f["path"]][target]["weight"] += 1  # weight = number of import statements
+                    G[f["path"]][target]["weight"] += 1
                 else:
                     G.add_edge(f["path"], target, weight=1)
 
-    # circular dependencies = strongly connected components with more than one file
     cycles = sorted(
         (sorted(c) for c in nx.strongly_connected_components(G) if len(c) > 1),
         key=lambda c: (-len(c), c[0]),
@@ -174,8 +241,8 @@ def build_dependency_graph(files: list[dict]) -> dict:
         metrics[p] = {
             "fan_in": fi,
             "fan_out": fo,
-            "centrality": round(pr[p] / top, 4),            # 0..1, 1 = most central file
-            "instability": round(fo / (fi + fo), 3) if fi + fo else 0.0,  # 0 = stable, 1 = unstable
+            "centrality": round(pr[p] / top, 4),
+            "instability": round(fo / (fi + fo), 3) if fi + fo else 0.0,
             "in_cycle": p in in_cycle,
         }
 
@@ -194,18 +261,3 @@ def build_dependency_graph(files: list[dict]) -> dict:
         "cycles": cycles[:MAX_CYCLES_STORED],
         "stats": stats,
     }
-
-
-if __name__ == "__main__":
-    # Quick manual test:  python -m app.engine.dependency_graph /path/to/repo
-    import sys
-
-    from app.engine.parser import parse_repository
-
-    result = build_dependency_graph(parse_repository(sys.argv[1])["files"])
-    print(result["stats"])
-    for c in result["cycles"][:5]:
-        print("cycle:", " <-> ".join(c))
-    top = sorted(result["metrics"].items(), key=lambda kv: kv[1]["fan_in"], reverse=True)[:5]
-    for path, m in top:
-        print(f"  fan_in={m['fan_in']:>3} fan_out={m['fan_out']:>3} centrality={m['centrality']}  {path}")

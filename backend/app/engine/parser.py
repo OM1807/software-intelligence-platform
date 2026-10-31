@@ -1,17 +1,22 @@
-"""Source parser: turns code files into a language-independent structure using Tree-sitter.
+"""Source parser: turns code files into a language-independent structure using Tree-sitter and AST extractors.
 
-Output per file (this is the contract other modules rely on):
+Supported languages:
+- Python (.py)
+- TypeScript / JavaScript (.ts, .tsx, .js, .jsx, .mjs, .cjs)
+- Java (.java)
+
+Output per file:
 {
   "path": "src/click/core.py", "language": "python", "loc": 120, "parse_errors": False,
   "functions": [{"name": "Foo.bar", "start_line": 10, "end_line": 25, "complexity": 4,
                  "is_method": True, "calls": ["print", "helper"]}],
   "classes":   [{"name": "Foo", "start_line": 5, "end_line": 40, "bases": ["Base"], "methods": ["bar"]}],
   "imports":   [{"module": "os.path", "names": [], "level": 0},
-                {"module": "utils", "names": ["helper"], "level": 1}]   # level>0 = relative import
+                {"module": "utils", "names": ["helper"], "level": 1}]
 }
-To add a language (e.g. Java): write an _extract_<lang>(root) function and add it to LANGUAGES.
 """
 import os
+import re
 from pathlib import Path
 
 import tree_sitter_python as tspython
@@ -21,6 +26,7 @@ MAX_FILE_BYTES = 1_000_000
 SKIP_DIRS = {
     ".git", "node_modules", "venv", ".venv", "env", "__pycache__", "site-packages",
     "build", "dist", ".tox", ".mypy_cache", ".pytest_cache", ".idea", ".vscode",
+    "target", ".next", "out",
 }
 
 
@@ -33,7 +39,7 @@ _PY_DEFS = {"function_definition", "class_definition"}
 _PY_BRANCHES = {
     "if_statement", "elif_clause", "for_statement", "while_statement", "except_clause",
     "boolean_operator", "conditional_expression", "case_clause",
-    "for_in_clause", "if_clause",  # comprehensions
+    "for_in_clause", "if_clause",
 }
 
 
@@ -84,7 +90,6 @@ def _py_import(node) -> list[dict]:
 def _extract_python(root) -> dict:
     functions, classes, imports = [], [], []
     class_by_qual = {}
-    # iterative walk (deeply nested code can exceed Python's recursion limit)
     stack = [(root, (), False)]
     while stack:
         node, scope, in_class = stack.pop()
@@ -111,8 +116,13 @@ def _extract_python(root) -> dict:
                 sup = child.child_by_field_name("superclasses")
                 bases = [_text(b) for b in sup.named_children if b.type != "keyword_argument"] if sup else []
                 qual = ".".join(scope + (name,))
-                entry = {"name": qual, "start_line": child.start_point[0] + 1,
-                         "end_line": child.end_point[0] + 1, "bases": bases, "methods": []}
+                entry = {
+                    "name": qual,
+                    "start_line": child.start_point[0] + 1,
+                    "end_line": child.end_point[0] + 1,
+                    "bases": bases,
+                    "methods": [],
+                }
                 classes.append(entry)
                 class_by_qual[qual] = entry
                 stack.append((child.child_by_field_name("body"), scope + (name,), True))
@@ -129,38 +139,250 @@ def _count_loc_python(source: str) -> int:
     return sum(1 for ln in source.splitlines() if ln.strip() and not ln.strip().startswith("#"))
 
 
+# ======================= JavaScript / TypeScript =======================
+_JS_IMPORT_RE = re.compile(
+    r"""(?:import\s+(?:(?:\*\s+as\s+\w+|(?:[\w\s,{}]+))\s+from\s+)?['"]([^'"]+)['"]|require\(['"]([^'"]+)['"]\)|import\(['"]([^'"]+)['"]\))""",
+    re.MULTILINE,
+)
+_JS_FUNC_RE = re.compile(
+    r"""(?:(?:export\s+)?(?:default\s+)?(?:async\s+)?function(?:\s+([a-zA-Z0-9_$]+))?\s*\(([^)]*)\)|(?:const|let|var)\s+([a-zA-Z0-9_$]+)\s*=\s*(?:async\s*)?(?:\([^)]*\)|[a-zA-Z0-9_$]+)\s*=>)""",
+    re.MULTILINE,
+)
+_JS_CLASS_RE = re.compile(
+    r"""(?:export\s+)?class\s+([a-zA-Z0-9_$]+)(?:\s+extends\s+([a-zA-Z0-9_$]+))?""",
+    re.MULTILINE,
+)
+_JS_BRANCH_RE = re.compile(r"""\b(if|else\s+if|for|while|catch|case|switch)\b|\?|&&|\|\|""")
+
+
+def _find_block_end(source: str, start_pos: int) -> int:
+    """Find the index of the matching closing brace after start_pos."""
+    open_brace = source.find("{", start_pos)
+    if open_brace == -1:
+        nl = source.find("\n", start_pos)
+        return nl if nl != -1 else len(source)
+    depth = 1
+    pos = open_brace + 1
+    length = len(source)
+    while pos < length and depth > 0:
+        ch = source[pos]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+        elif ch == '"' or ch == "'" or ch == "`":
+            quote = ch
+            pos += 1
+            while pos < length and source[pos] != quote:
+                if source[pos] == "\\":
+                    pos += 1
+                pos += 1
+        pos += 1
+    return pos
+
+
+def _extract_js_ts(source_code: str) -> dict:
+    functions, classes, imports = [], [], []
+
+    # extract imports
+    for m in _JS_IMPORT_RE.finditer(source_code):
+        mod = m.group(1) or m.group(2) or m.group(3)
+        if mod:
+            level = 1 if mod.startswith(".") else 0
+            imports.append({"module": mod, "names": [], "level": level})
+
+    # extract classes
+    for m in _JS_CLASS_RE.finditer(source_code):
+        name = m.group(1)
+        base = [m.group(2)] if m.group(2) else []
+        start_line = source_code[:m.start()].count("\n") + 1
+        end_pos = _find_block_end(source_code, m.start())
+        end_line = source_code[:end_pos].count("\n") + 1
+        classes.append({
+            "name": name,
+            "start_line": start_line,
+            "end_line": max(start_line, end_line),
+            "bases": base,
+            "methods": [],
+        })
+
+    # extract functions
+    for m in _JS_FUNC_RE.finditer(source_code):
+        name = m.group(1) or m.group(3) or "anonymous"
+        start_line = source_code[:m.start()].count("\n") + 1
+        end_pos = _find_block_end(source_code, m.start())
+        end_line = source_code[:end_pos].count("\n") + 1
+        fn_slice = source_code[m.start():end_pos]
+        branches = len(_JS_BRANCH_RE.findall(fn_slice))
+        functions.append({
+            "name": name,
+            "start_line": start_line,
+            "end_line": max(start_line, end_line),
+            "complexity": 1 + branches,
+            "is_method": False,
+            "calls": [],
+        })
+
+    return {"functions": functions, "classes": classes, "imports": imports}
+
+
+def _count_loc_c_style(source: str) -> int:
+    loc = 0
+    in_block = False
+    for line in source.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        if in_block:
+            if "*/" in s:
+                in_block = False
+            continue
+        if s.startswith("/*"):
+            if "*/" not in s:
+                in_block = True
+            continue
+        if s.startswith("//"):
+            continue
+        loc += 1
+    return loc
+
+
+# ======================= Java =======================
+_JAVA_IMPORT_RE = re.compile(r"""^\s*import\s+(?:static\s+)?([a-zA-Z0-9_.*]+);""", re.MULTILINE)
+_JAVA_CLASS_RE = re.compile(
+    r"""(?:public|protected|private)?\s*(?:static\s+)?(?:final\s+)?(?:abstract\s+)?class\s+([a-zA-Z0-9_$]+)(?:\s+extends\s+([a-zA-Z0-9_$]+))?(?:\s+implements\s+([a-zA-Z0-9_$,\s]+))?""",
+    re.MULTILINE,
+)
+_JAVA_METHOD_RE = re.compile(
+    r"""(?:public|protected|private)?\s*(?:static\s+)?(?:final\s+)?(?:synchronized\s+)?(?:<[^>]+>\s+)?[a-zA-Z0-9_<>,\[\]]+\s+([a-zA-Z0-9_$]+)\s*\(([^)]*)\)\s*(?:throws\s+[a-zA-Z0-9_,\s]+)?\s*\{""",
+    re.MULTILINE,
+)
+
+
+def _extract_java(source_code: str) -> dict:
+    functions, classes, imports = [], [], []
+    for m in _JAVA_IMPORT_RE.finditer(source_code):
+        mod = m.group(1)
+        imports.append({"module": mod, "names": [mod.split(".")[-1]], "level": 0})
+
+    for m in _JAVA_CLASS_RE.finditer(source_code):
+        name = m.group(1)
+        base = [m.group(2)] if m.group(2) else []
+        start_line = source_code[:m.start()].count("\n") + 1
+        end_pos = _find_block_end(source_code, m.start())
+        end_line = source_code[:end_pos].count("\n") + 1
+        classes.append({
+            "name": name,
+            "start_line": start_line,
+            "end_line": max(start_line, end_line),
+            "bases": base,
+            "methods": [],
+        })
+
+    for m in _JAVA_METHOD_RE.finditer(source_code):
+        name = m.group(1)
+        start_line = source_code[:m.start()].count("\n") + 1
+        end_pos = _find_block_end(source_code, m.start())
+        end_line = source_code[:end_pos].count("\n") + 1
+        method_slice = source_code[m.start():end_pos]
+        branches = len(_JS_BRANCH_RE.findall(method_slice))
+        functions.append({
+            "name": name,
+            "start_line": start_line,
+            "end_line": max(start_line, end_line),
+            "complexity": 1 + branches,
+            "is_method": True,
+            "calls": [],
+        })
+
+    return {"functions": functions, "classes": classes, "imports": imports}
+
+
 # ======================= Registry =======================
-LANGUAGES = {
+_LANGUAGES = {
     ".py": {
         "name": "python",
+        "type": "tree_sitter",
         "language": Language(tspython.language()),
         "extract": _extract_python,
         "loc": _count_loc_python,
     },
-    # ".java": {...}  <- add Java here later
+    ".ts": {
+        "name": "typescript",
+        "type": "text",
+        "extract": _extract_js_ts,
+        "loc": _count_loc_c_style,
+    },
+    ".tsx": {
+        "name": "typescript",
+        "type": "text",
+        "extract": _extract_js_ts,
+        "loc": _count_loc_c_style,
+    },
+    ".js": {
+        "name": "javascript",
+        "type": "text",
+        "extract": _extract_js_ts,
+        "loc": _count_loc_c_style,
+    },
+    ".jsx": {
+        "name": "javascript",
+        "type": "text",
+        "extract": _extract_js_ts,
+        "loc": _count_loc_c_style,
+    },
+    ".mjs": {
+        "name": "javascript",
+        "type": "text",
+        "extract": _extract_js_ts,
+        "loc": _count_loc_c_style,
+    },
+    ".cjs": {
+        "name": "javascript",
+        "type": "text",
+        "extract": _extract_js_ts,
+        "loc": _count_loc_c_style,
+    },
+    ".java": {
+        "name": "java",
+        "type": "text",
+        "extract": _extract_java,
+        "loc": _count_loc_c_style,
+    },
 }
+
 _parsers: dict[str, Parser] = {}
 
 
 def _get_parser(ext: str) -> Parser:
     if ext not in _parsers:
-        _parsers[ext] = Parser(LANGUAGES[ext]["language"])
+        _parsers[ext] = Parser(_LANGUAGES[ext]["language"])
     return _parsers[ext]
 
 
 # ======================= Public API =======================
 def parse_source(source: bytes, ext: str, rel_path: str = "") -> dict | None:
     """Parse one file's bytes. Returns None if the extension isn't supported."""
-    cfg = LANGUAGES.get(ext)
+    cfg = _LANGUAGES.get(ext)
     if cfg is None:
         return None
-    tree = _get_parser(ext).parse(source)
-    result = cfg["extract"](tree.root_node)
+
+    text_content = source.decode("utf-8", errors="ignore")
+    loc = cfg["loc"](text_content)
+
+    if cfg.get("type") == "tree_sitter":
+        tree = _get_parser(ext).parse(source)
+        result = cfg["extract"](tree.root_node)
+        has_error = tree.root_node.has_error
+    else:
+        result = cfg["extract"](text_content)
+        has_error = False
+
     return {
         "path": rel_path,
         "language": cfg["name"],
-        "loc": cfg["loc"](source.decode("utf-8", errors="ignore")),
-        "parse_errors": tree.root_node.has_error,
+        "loc": loc,
+        "parse_errors": has_error,
         **result,
     }
 
@@ -178,7 +400,7 @@ def parse_repository(repo_path: str | Path) -> dict:
         dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
         for fn in filenames:
             ext = os.path.splitext(fn)[1].lower()
-            if ext not in LANGUAGES:
+            if ext not in _LANGUAGES:
                 continue
             full = Path(dirpath) / fn
             try:
@@ -189,7 +411,8 @@ def parse_repository(repo_path: str | Path) -> dict:
             except (OSError, ValueError):
                 skipped += 1
                 continue
-            files.append(parsed)
+            if parsed:
+                files.append(parsed)
     files.sort(key=lambda f: f["path"])
     return {
         "files": files,
@@ -197,14 +420,3 @@ def parse_repository(repo_path: str | Path) -> dict:
         "total_functions": sum(len(f["functions"]) for f in files),
         "total_classes": sum(len(f["classes"]) for f in files),
     }
-
-
-if __name__ == "__main__":
-    # Quick manual test:  python -m app.engine.parser /path/to/cloned/repo
-    import sys
-    r = parse_repository(sys.argv[1])
-    print(f"files={len(r['files'])} functions={r['total_functions']} "
-          f"classes={r['total_classes']} skipped={r['skipped']}")
-    worst = sorted((fn["complexity"], f["path"], fn["name"]) for f in r["files"] for fn in f["functions"])[-5:]
-    for c, path, name in reversed(worst):
-        print(f"  complexity {c:>3}  {path}::{name}")

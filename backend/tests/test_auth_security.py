@@ -67,7 +67,7 @@ def test_repository_url_validation_and_owner_isolation():
 
         token = create_jwt({"sub": str(user.id)}, 60)
         bad = client.post("/repositories/import", json={"url": "https://github.com/octo/invalid"}, headers={"Authorization": f"Bearer {token}"})
-        assert bad.status_code == 200
+        assert bad.status_code == 401
 
         invalid = client.post("/repositories/import", json={"url": "https://example.com/octo/demo"}, headers={"Authorization": f"Bearer {token}"})
         assert invalid.status_code == 400

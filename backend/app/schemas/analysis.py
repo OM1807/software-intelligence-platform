@@ -34,7 +34,30 @@ class AnalysisOut(BaseModel):
     repo_id: int
     summary: HealthSummary
     risky_files: list[FileMetric]
-    explanation: str | None = None  # LLM-generated text (Phase 4)
+    explanation: str | None = None
+
+
+class RuleCreate(BaseModel):
+    rule_id: str = Field(..., min_length=2, max_length=100)
+    rule_name: str = Field(..., min_length=2, max_length=200)
+    rule_description: str | None = None
+    source_layer: str = Field(..., min_length=1, max_length=100)
+    target_layer: str = Field(..., min_length=1, max_length=100)
+    severity: str = Field(default="medium")  # high | medium | low
+    is_active: bool = True
+
+
+class RuleOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+    repo_id: int | None
+    rule_id: str
+    rule_name: str
+    rule_description: str | None = None
+    source_layer: str
+    target_layer: str
+    severity: str
+    is_active: bool
 
 
 class DriftViolation(BaseModel):
@@ -47,6 +70,8 @@ class DriftViolation(BaseModel):
 class DriftReport(BaseModel):
     repo_id: int
     violations: list[DriftViolation]
+    rules: list[RuleOut] = Field(default_factory=list)
+    compliance_score: float = 100.0
 
 
 class ImpactRequest(BaseModel):
@@ -90,3 +115,25 @@ class EngineeringReport(BaseModel):
     recommendations: list[Recommendation] = Field(default_factory=list)
     ai_explanation: str | None = None
     llm_available: bool = False
+
+
+class AskAIRequest(BaseModel):
+    question: str = Field(..., min_length=2, max_length=1000)
+
+
+class AskAIResponse(BaseModel):
+    repo_id: int
+    question: str
+    answer: str
+    provider: str
+
+
+class SystemConfigOut(BaseModel):
+    environment: str
+    llm_configured: bool
+    default_depth: int
+    supported_languages: list[str]
+
+
+class SystemConfigUpdate(BaseModel):
+    llm_api_key: str | None = None

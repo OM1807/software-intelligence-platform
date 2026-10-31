@@ -5,7 +5,6 @@ from pydantic import BaseModel, ConfigDict
 
 class RepoImport(BaseModel):
     url: str
-    access_token: str | None = None  # optional PAT for private repos
 
 
 class RepoOut(BaseModel):

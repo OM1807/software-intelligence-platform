@@ -1,20 +1,32 @@
 import logging
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy.orm import Session
 from pydantic import BaseModel, Field
+from sqlalchemy.orm import Session
 
 from app.api.endpoints.auth import get_current_user
 from app.api.endpoints.repositories import get_user_repo
 from app.core.config import settings
 from app.core.database import get_db
 from app.engine.change_impact import analyze_change_impact
-from app.engine.llm_service import generate_ai_response, generate_structured_repo_explanation
+from app.engine.llm_service import (
+    answer_repository_question,
+    generate_ai_response,
+    generate_structured_repo_explanation,
+)
 from app.engine.report_generator import build_report
 from app.engine.risk_calculator import HIGH_RISK_THRESHOLD, compute_health_index, recalculate_file_risk_scores
-from app.models.schema import Analysis, DependencyEdge, FileMetric as FileMetricRow, User
+from app.models.schema import (
+    Analysis,
+    ArchitectureRule as ArchitectureRuleRow,
+    DependencyEdge,
+    FileMetric as FileMetricRow,
+    User,
+)
 from app.schemas.analysis import (
     AnalysisOut,
+    AskAIRequest,
+    AskAIResponse,
     DependencyGraph,
     DriftReport,
     DriftViolation,
@@ -24,6 +36,10 @@ from app.schemas.analysis import (
     ImpactItem,
     ImpactReport,
     ImpactRequest,
+    RuleCreate,
+    RuleOut,
+    SystemConfigOut,
+    SystemConfigUpdate,
 )
 from app.schemas.metrics import FileMetric as PublicFileMetric, HealthSummary
 
@@ -31,7 +47,13 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-# Request body for Gemini prompt testing
+DEFAULT_DRIFT_RULES = [
+    {"id": "api-cannot-import-engine", "source": "api", "target": "engine", "severity": "high"},
+    {"id": "api-cannot-import-models", "source": "api", "target": "models", "severity": "medium"},
+    {"id": "core-cannot-import-api", "source": "core", "target": "api", "severity": "medium"},
+]
+
+
 class AITestRequest(BaseModel):
     prompt: str = Field(
         ...,
@@ -82,23 +104,30 @@ def _rule_matches(value: str, pattern: str) -> bool:
     pattern = pattern.replace("\\", "/").lower().strip("/")
     if not pattern:
         return False
-    return value == pattern or value.startswith(f"{pattern}/") or f"/{pattern}/" in value
+    return value == pattern or value.startswith(f"{pattern}/") or f"/{pattern}/" in value or value.endswith(f"/{pattern}")
 
 
-def evaluate_drift_rules(edges: list[DependencyEdge]) -> list[DriftViolation]:
-    rules = [
-        {"id": "api-cannot-import-engine", "source": "api", "target": "engine", "severity": "high"},
-        {"id": "api-cannot-import-models", "source": "api", "target": "models", "severity": "medium"},
-        {"id": "core-cannot-import-api", "source": "core", "target": "api", "severity": "medium"},
-    ]
+def evaluate_drift_rules(
+    edges: list[DependencyEdge],
+    rules: list[dict] | None = None,
+) -> list[DriftViolation]:
+    active_rules = rules if rules is not None else DEFAULT_DRIFT_RULES
     violations: list[DriftViolation] = []
     seen: set[tuple[str, str, str]] = set()
+
     for edge in edges:
         src = edge.source or ""
         tgt = edge.target or ""
-        for rule in rules:
-            if _rule_matches(src, rule["source"]) and _rule_matches(tgt, rule["target"]):
-                key = (src, tgt, rule["id"])
+        for rule in active_rules:
+            if not rule.get("is_active", True):
+                continue
+            rule_id = rule.get("id") or rule.get("rule_id", "rule")
+            rule_src = rule.get("source") or rule.get("source_layer", "")
+            rule_tgt = rule.get("target") or rule.get("target_layer", "")
+            severity = rule.get("severity", "medium")
+
+            if _rule_matches(src, rule_src) and _rule_matches(tgt, rule_tgt):
+                key = (src, tgt, rule_id)
                 if key in seen:
                     continue
                 seen.add(key)
@@ -106,8 +135,8 @@ def evaluate_drift_rules(edges: list[DependencyEdge]) -> list[DriftViolation]:
                     DriftViolation(
                         source=src,
                         target=tgt,
-                        rule=rule["id"],
-                        severity=rule["severity"],
+                        rule=rule_id,
+                        severity=severity,
                     )
                 )
     return violations
@@ -118,14 +147,14 @@ def get_analysis(
     repo_id: int,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
-    limit: int = 10,
+    limit: int = 200,
     skip: int = 0,
 ):
     repo = get_user_repo(db, repo_id, user)
     if repo.status != "completed":
         raise HTTPException(status_code=409, detail=f"Analysis not ready (status: {repo.status})")
-    if limit < 1 or limit > 200:
-        raise HTTPException(status_code=400, detail="limit must be between 1 and 200")
+    if limit < 1 or limit > 500:
+        raise HTTPException(status_code=400, detail="limit must be between 1 and 500")
     if skip < 0:
         raise HTTPException(status_code=400, detail="skip must be >= 0")
 
@@ -151,16 +180,12 @@ def get_risk(
     repo_id: int,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
-    limit: int = 10,
+    limit: int = 100,
     skip: int = 0,
 ):
     repo = get_user_repo(db, repo_id, user)
     if repo.status != "completed":
         raise HTTPException(status_code=409, detail=f"Analysis not ready (status: {repo.status})")
-    if limit < 1 or limit > 200:
-        raise HTTPException(status_code=400, detail="limit must be between 1 and 200")
-    if skip < 0:
-        raise HTTPException(status_code=400, detail="skip must be >= 0")
     return _build_risk_list(repo_id, db, limit=limit, skip=skip)
 
 
@@ -179,16 +204,22 @@ def get_dependencies(
     edges = db.query(DependencyEdge).filter_by(repo_id=repo_id).all()
     analysis = db.query(Analysis).filter_by(repo_id=repo_id).first()
 
-    if not include_isolated:  # hide files with no dependencies at all (less clutter in the graph view)
+    if not include_isolated:
         connected = {e.source for e in edges} | {e.target for e in edges}
         files = [f for f in files if f.path in connected]
 
     return DependencyGraph(
         nodes=[
             GraphNode(
-                id=f.path, label=f.path.split("/")[-1], language=f.language, loc=f.loc,
-                fan_in=f.fan_in, fan_out=f.fan_out, centrality=f.centrality,
-                instability=f.instability, in_cycle=f.in_cycle,
+                id=f.path,
+                label=f.path.split("/")[-1],
+                language=f.language,
+                loc=f.loc,
+                fan_in=f.fan_in,
+                fan_out=f.fan_out,
+                centrality=f.centrality,
+                instability=f.instability,
+                in_cycle=f.in_cycle,
             )
             for f in files
         ],
@@ -198,19 +229,110 @@ def get_dependencies(
     )
 
 
+# ---------- Architecture Rules CRUD (Software Architect) ----------
+@router.get("/{repo_id}/rules", response_model=list[RuleOut])
+def get_rules(repo_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    get_user_repo(db, repo_id, user)
+    rules = db.query(ArchitectureRuleRow).filter_by(repo_id=repo_id).all()
+    if not rules:
+        # Seed default architecture rules for this repo
+        default_objs = [
+            ArchitectureRuleRow(
+                repo_id=repo_id,
+                rule_id=r["id"],
+                rule_name=r["id"].replace("-", " ").title(),
+                rule_description=f"Modules in layer '{r['source']}' cannot import '{r['target']}'",
+                source_layer=r["source"],
+                target_layer=r["target"],
+                severity=r["severity"],
+                is_active=True,
+            )
+            for r in DEFAULT_DRIFT_RULES
+        ]
+        db.add_all(default_objs)
+        db.commit()
+        rules = db.query(ArchitectureRuleRow).filter_by(repo_id=repo_id).all()
+    return rules
+
+
+@router.post("/{repo_id}/rules", response_model=RuleOut)
+def create_rule(repo_id: int, body: RuleCreate, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    get_user_repo(db, repo_id, user)
+    existing = db.query(ArchitectureRuleRow).filter_by(repo_id=repo_id, rule_id=body.rule_id).first()
+    if existing:
+        raise HTTPException(status_code=400, detail="Rule ID already exists for this repository")
+
+    rule = ArchitectureRuleRow(
+        repo_id=repo_id,
+        rule_id=body.rule_id.strip(),
+        rule_name=body.rule_name.strip(),
+        rule_description=body.rule_description,
+        source_layer=body.source_layer.strip(),
+        target_layer=body.target_layer.strip(),
+        severity=body.severity.lower() if body.severity in {"low", "medium", "high"} else "medium",
+        is_active=body.is_active,
+    )
+    db.add(rule)
+    db.commit()
+    db.refresh(rule)
+    return rule
+
+
+@router.delete("/{repo_id}/rules/{rule_id}", status_code=204)
+def delete_rule(repo_id: int, rule_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    get_user_repo(db, repo_id, user)
+    rule = db.query(ArchitectureRuleRow).filter_by(id=rule_id, repo_id=repo_id).first()
+    if not rule:
+        raise HTTPException(status_code=404, detail="Rule not found")
+    db.delete(rule)
+    db.commit()
+
+
+@router.patch("/{repo_id}/rules/{rule_id}/toggle", response_model=RuleOut)
+def toggle_rule(repo_id: int, rule_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    get_user_repo(db, repo_id, user)
+    rule = db.query(ArchitectureRuleRow).filter_by(id=rule_id, repo_id=repo_id).first()
+    if not rule:
+        raise HTTPException(status_code=404, detail="Rule not found")
+    rule.is_active = not rule.is_active
+    db.commit()
+    db.refresh(rule)
+    return rule
+
+
 @router.get("/{repo_id}/drift", response_model=DriftReport)
-def get_drift(
-    repo_id: int,
-    db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
-):
+def get_drift(repo_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     repo = get_user_repo(db, repo_id, user)
     if repo.status != "completed":
         raise HTTPException(status_code=409, detail=f"Analysis not ready (status: {repo.status})")
 
     edges = db.query(DependencyEdge).filter_by(repo_id=repo_id).all()
-    violations = evaluate_drift_rules(edges)
-    return DriftReport(repo_id=repo_id, violations=violations)
+    rules = db.query(ArchitectureRuleRow).filter_by(repo_id=repo_id).all()
+    if not rules:
+        rules_dicts = DEFAULT_DRIFT_RULES
+        rule_outs = []
+    else:
+        rules_dicts = [
+            {
+                "id": r.rule_id,
+                "source": r.source_layer,
+                "target": r.target_layer,
+                "severity": r.severity,
+                "is_active": r.is_active,
+            }
+            for r in rules
+        ]
+        rule_outs = [RuleOut.model_validate(r) for r in rules]
+
+    violations = evaluate_drift_rules(edges, rules_dicts)
+    compliance_score = max(0.0, round((1.0 - (len(violations) / max(1, len(edges)))) * 100, 1))
+
+    return DriftReport(
+        repo_id=repo_id,
+        violations=violations,
+        rules=rule_outs,
+        compliance_score=compliance_score,
+    )
 
 
 @router.post("/{repo_id}/impact", response_model=ImpactReport)
@@ -220,7 +342,6 @@ def change_impact(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    """Static impact analysis based on the repository dependency graph."""
     repo = get_user_repo(db, repo_id, user)
     if repo.status != "completed":
         raise HTTPException(status_code=409, detail=f"Analysis not ready (status: {repo.status})")
@@ -231,6 +352,13 @@ def change_impact(
     rows = db.query(FileMetricRow).filter_by(repo_id=repo_id).all()
     edges = db.query(DependencyEdge).filter_by(repo_id=repo_id).all()
     impact = analyze_change_impact(rows, edges, payload.changed_files, depth=payload.depth, limit=payload.limit)
+    if impact["ignored_files"]:
+        invalid = ", ".join(impact["ignored_files"][:5])
+        suffix = " ..." if len(impact["ignored_files"]) > 5 else ""
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown file path(s): {invalid}{suffix}. Use paths from the analyzed repository.",
+        )
     return ImpactReport(
         repo_id=repo_id,
         changed_files=impact["changed_files"],
@@ -258,7 +386,6 @@ def get_report(
     limit: int = Query(default=25, ge=1, le=100),
     include_ai: bool = Query(default=False),
 ):
-    """Generate a deterministic engineering summary from stored analysis and metrics."""
     repo = get_user_repo(db, repo_id, user)
     if repo.status != "completed":
         raise HTTPException(status_code=409, detail=f"Analysis not ready (status: {repo.status})")
@@ -266,32 +393,36 @@ def get_report(
     rows = db.query(FileMetricRow).filter_by(repo_id=repo_id).all()
     edges = db.query(DependencyEdge).filter_by(repo_id=repo_id).all()
     analysis = db.query(Analysis).filter_by(repo_id=repo_id).first()
-    violations = evaluate_drift_rules(edges)
+    rules = db.query(ArchitectureRuleRow).filter_by(repo_id=repo_id).all()
+    rules_dicts = [
+        {"id": r.rule_id, "source": r.source_layer, "target": r.target_layer, "severity": r.severity, "is_active": r.is_active}
+        for r in rules
+    ] if rules else None
+
+    violations = evaluate_drift_rules(edges, rules_dicts)
     report = build_report(repo, analysis, rows, edges, violations, changed_files=changed_files, depth=depth, limit=limit)
 
+    summary = {
+        "health_index": report.summary.health_index,
+        "total_files": report.summary.total_files,
+        "total_commits": report.summary.total_commits,
+        "high_risk_files": report.summary.high_risk_files,
+        "top_risky_files": [
+            {"path": item.path, "risk_score": item.risk_score} for item in report.highest_risk_files[:5]
+        ],
+        "architecture_violations": [
+            f"{item.source} -> {item.target} ({item.rule})" for item in report.architecture_violations
+        ],
+        "cycles": list(report.cycles),
+        "impact": [f"{item.path} (depth={item.depth})" for item in report.impact.impacted_files] if report.impact else [],
+    }
+
     if include_ai:
-        summary = {
-            "health_index": report.summary.health_index,
-            "total_files": report.summary.total_files,
-            "total_commits": report.summary.total_commits,
-            "high_risk_files": report.summary.high_risk_files,
-            "top_risky_files": [
-                {"path": item.path, "risk_score": item.risk_score} for item in report.highest_risk_files[:5]
-            ],
-            "architecture_violations": [
-                f"{item.source} -> {item.target} ({item.rule})" for item in report.architecture_violations
-            ],
-            "impact": [
-                f"{item.path} (depth={item.depth})" for item in report.impact.impacted_files
-            ] if report.impact else [],
-        }
         explanation = generate_structured_repo_explanation(summary)
         report.ai_explanation = explanation
-        report.llm_available = bool(settings.LLM_API_KEY)
     else:
         report.ai_explanation = None
-        report.llm_available = bool(settings.LLM_API_KEY)
-
+    report.llm_available = bool(settings.LLM_API_KEY)
     return report
 
 
@@ -302,7 +433,6 @@ def explain_repo_summary(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    """Optional repository-specific AI explanation using only bounded structured facts."""
     repo = get_user_repo(db, repo_id, user)
     if repo.status != "completed":
         raise HTTPException(status_code=409, detail=f"Analysis not ready (status: {repo.status})")
@@ -323,12 +453,70 @@ def explain_repo_summary(
         "architecture_violations": [
             f"{item.source} -> {item.target} ({item.rule})" for item in report.architecture_violations
         ],
+        "cycles": list(report.cycles),
         "impact": [f"{item.path} (depth={item.depth})" for item in report.impact.impacted_files] if report.impact else [],
     }
     llm_explanation = generate_structured_repo_explanation(summary)
-    if llm_explanation is None:
-        raise HTTPException(status_code=503, detail="Optional AI explanation is unavailable because no API key is configured.")
     return {"repo_id": repo_id, "explanation": llm_explanation}
+
+
+@router.post("/{repo_id}/ai-ask", response_model=AskAIResponse)
+def ask_ai(
+    repo_id: int,
+    payload: AskAIRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Ask AI Assistant: Natural language queries on codebase health, risks, architecture, and impact."""
+    repo = get_user_repo(db, repo_id, user)
+    if repo.status != "completed":
+        raise HTTPException(status_code=409, detail=f"Analysis not ready (status: {repo.status})")
+
+    rows = db.query(FileMetricRow).filter_by(repo_id=repo_id).all()
+    edges = db.query(DependencyEdge).filter_by(repo_id=repo_id).all()
+    analysis = db.query(Analysis).filter_by(repo_id=repo_id).first()
+    violations = evaluate_drift_rules(edges)
+    report = build_report(repo, analysis, rows, edges, violations)
+
+    summary = {
+        "health_index": report.summary.health_index,
+        "total_files": report.summary.total_files,
+        "total_commits": report.summary.total_commits,
+        "high_risk_files": report.summary.high_risk_files,
+        "top_risky_files": [
+            {"path": item.path, "risk_score": item.risk_score} for item in report.highest_risk_files[:5]
+        ],
+        "architecture_violations": [
+            f"{item.source} -> {item.target} ({item.rule})" for item in report.architecture_violations
+        ],
+        "cycles": list(report.cycles),
+    }
+
+    answer = answer_repository_question(summary, payload.question)
+    provider = "gemini" if settings.LLM_API_KEY else "local-intelligence-engine"
+    return AskAIResponse(repo_id=repo_id, question=payload.question, answer=answer, provider=provider)
+
+
+@router.get("/system/config", response_model=SystemConfigOut)
+def get_system_config(user: User = Depends(get_current_user)):
+    return SystemConfigOut(
+        environment=settings.ENVIRONMENT,
+        llm_configured=bool(settings.LLM_API_KEY),
+        default_depth=3,
+        supported_languages=["Python", "TypeScript", "JavaScript", "Java"],
+    )
+
+
+@router.post("/system/config", response_model=SystemConfigOut)
+def update_system_config(payload: SystemConfigUpdate, user: User = Depends(get_current_user)):
+    if payload.llm_api_key is not None:
+        settings.LLM_API_KEY = payload.llm_api_key.strip()
+    return SystemConfigOut(
+        environment=settings.ENVIRONMENT,
+        llm_configured=bool(settings.LLM_API_KEY),
+        default_depth=3,
+        supported_languages=["Python", "TypeScript", "JavaScript", "Java"],
+    )
 
 
 @router.post("/ai-test")
@@ -337,32 +525,15 @@ def test_gemini(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    """Send a custom prompt to Gemini for an authenticated user."""
-
     prompt = request.prompt.strip()
-
     if not prompt:
-        raise HTTPException(
-            status_code=400,
-            detail="Prompt cannot be empty.",
-        )
-
+        raise HTTPException(status_code=400, detail="Prompt cannot be empty.")
     try:
         answer = generate_ai_response(prompt)
-
-        return {
-            "provider": "gemini",
-            "prompt": prompt,
-            "response": answer,
-        }
-
+        return {"provider": "gemini", "prompt": prompt, "response": answer}
     except Exception:
         logger.exception("Gemini integration test failed.")
-
         raise HTTPException(
             status_code=502,
-            detail=(
-                "Gemini request failed. Check backend logs and "
-                "verify API key, model availability, and configuration."
-            ),
+            detail="Gemini request failed. Check backend logs and verify API key, model availability, and configuration.",
         )

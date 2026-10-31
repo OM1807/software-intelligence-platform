@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from urllib.parse import urlencode
 
 import httpx
@@ -23,7 +23,8 @@ GITHUB_API_USER = "https://api.github.com/user"
 
 # ---------- helpers ----------
 def create_jwt(payload: dict, minutes: int) -> str:
-    data = {**payload, "exp": datetime.utcnow() + timedelta(minutes=minutes)}
+    exp = datetime.now(timezone.utc) + timedelta(minutes=minutes)
+    data = {**payload, "exp": exp}
     return jwt.encode(data, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
 
 
@@ -34,9 +35,9 @@ def decode_jwt(token: str) -> dict:
 def upsert_github_user(db: Session, gh: dict, token: str) -> User:
     user = db.query(User).filter(User.github_id == gh["id"]).first()
     if not user:
-        user = User(github_id=gh["id"], username=gh["login"])
+        user = User(github_id=gh["id"], username=gh.get("login", "github_user"), role="developer")
         db.add(user)
-    user.username = gh["login"]
+    user.username = gh.get("login", user.username)
     user.email = gh.get("email")
     user.avatar_url = gh.get("avatar_url")
     user.github_token = token
@@ -80,10 +81,15 @@ class UserOut(BaseModel):
     username: str
     email: str | None = None
     avatar_url: str | None = None
+    role: str = "developer"
 
 
 class PATLogin(BaseModel):
     token: str
+
+
+class RoleUpdate(BaseModel):
+    role: str
 
 
 class TokenOut(BaseModel):
@@ -97,11 +103,11 @@ class TokenOut(BaseModel):
 def github_login():
     if not settings.GITHUB_CLIENT_ID:
         raise HTTPException(status_code=500, detail="GITHUB_CLIENT_ID is not configured")
-    state = create_jwt({"purpose": "oauth_state"}, minutes=10)  # CSRF protection
+    state = create_jwt({"purpose": "oauth_state"}, minutes=10)
     params = {
         "client_id": settings.GITHUB_CLIENT_ID,
         "redirect_uri": f"{settings.BACKEND_URL}/auth/github/callback",
-        "scope": "repo read:user user:email",  # `repo` = access to private repos
+        "scope": "repo read:user user:email",
         "state": state,
     }
     return RedirectResponse(f"{GITHUB_AUTHORIZE_URL}?{urlencode(params)}")
@@ -136,7 +142,6 @@ def github_callback(
 
     user = upsert_github_user(db, fetch_github_user(gh_token), gh_token)
     jwt_token = create_jwt({"sub": str(user.id)}, settings.ACCESS_TOKEN_EXPIRE_MINUTES)
-    # Frontend /login page reads ?token=... and stores it
     return RedirectResponse(f"{settings.FRONTEND_URL}/login?token={jwt_token}")
 
 
@@ -146,6 +151,18 @@ def login_with_pat(body: PATLogin, db: Session = Depends(get_db)):
     user = upsert_github_user(db, fetch_github_user(body.token), body.token)
     jwt_token = create_jwt({"sub": str(user.id)}, settings.ACCESS_TOKEN_EXPIRE_MINUTES)
     return TokenOut(access_token=jwt_token, user=UserOut.model_validate(user))
+
+
+@router.post("/role", response_model=UserOut)
+def update_role(body: RoleUpdate, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    """Allow switching roles between Developer, Software Architect, and Administrator."""
+    valid_roles = {"developer", "architect", "administrator"}
+    if body.role.lower() not in valid_roles:
+        raise HTTPException(status_code=400, detail="Role must be developer, architect, or administrator")
+    user.role = body.role.lower()
+    db.commit()
+    db.refresh(user)
+    return user
 
 
 @router.get("/me", response_model=UserOut)

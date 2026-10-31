@@ -1,14 +1,16 @@
-"""Repository mining: clone a GitHub repo and extract commit history + per-file stats."""
+"""Repository mining: clone or read local Git repos, extract commit history + per-file stats."""
+import os
 import shutil
 from collections import defaultdict
+from datetime import datetime, timezone
 from pathlib import Path
 
-from git import Repo
+from git import InvalidGitRepositoryError, Repo
 from git.exc import GitCommandError
 
 from app.core.config import settings
 
-SEP = "\x1f"  # field separator that can't appear in names/messages
+SEP = "\x1f"
 MARK = "@@COMMIT@@"
 
 
@@ -20,7 +22,7 @@ def clone_repo(owner: str, name: str, dest_name: str, token: str | None = None) 
     """Clone (or refresh) a repo into REPOS_DIR/dest_name and return its path."""
     dest = Path(settings.REPOS_DIR) / dest_name
     if dest.exists():
-        shutil.rmtree(dest)
+        shutil.rmtree(dest, ignore_errors=True)
     dest.parent.mkdir(parents=True, exist_ok=True)
 
     auth = f"x-access-token:{token}@" if token else ""
@@ -29,34 +31,47 @@ def clone_repo(owner: str, name: str, dest_name: str, token: str | None = None) 
         repo = Repo.clone_from(url, dest, env={"GIT_TERMINAL_PROMPT": "0"})
     except GitCommandError as e:
         shutil.rmtree(dest, ignore_errors=True)
-        # never leak the token in error messages
         msg = str(e).replace(token, "***") if token else str(e)
         raise CloneError(f"Could not clone {owner}/{name}: {msg[-300:]}") from None
-    # don't keep the token inside .git/config
+
     repo.remote("origin").set_url(f"https://github.com/{owner}/{name}.git")
     return dest
 
 
 def mine_commits(repo_path: str | Path) -> list[dict]:
     """One pass over `git log --numstat`. Returns commits, newest first."""
-    repo = Repo(repo_path)
+    try:
+        repo = Repo(repo_path)
+    except (InvalidGitRepositoryError, Exception):
+        return []
+
     fmt = f"{MARK}%H{SEP}%an{SEP}%ae{SEP}%aI{SEP}%s"
-    out = repo.git.log("--no-renames", "--numstat", f"--pretty=format:{fmt}")
+    try:
+        out = repo.git.log("--no-renames", "--numstat", f"--pretty=format:{fmt}")
+    except (GitCommandError, Exception):
+        return []
 
     commits, current = [], None
     for line in out.splitlines():
         if line.startswith(MARK):
-            sha, author, email, date, msg = line[len(MARK):].split(SEP, 4)
-            current = {"sha": sha, "author": author, "email": email,
-                       "date": date, "message": msg, "files": []}
-            commits.append(current)
+            try:
+                sha, author, email, date, msg = line[len(MARK):].split(SEP, 4)
+                current = {"sha": sha, "author": author, "email": email,
+                           "date": date, "message": msg, "files": []}
+                commits.append(current)
+            except ValueError:
+                current = None
         elif line.strip() and current is not None:
-            added, deleted, path = line.split("\t", 2)
-            current["files"].append({
-                "path": path,
-                "added": int(added) if added.isdigit() else 0,   # "-" = binary file
-                "deleted": int(deleted) if deleted.isdigit() else 0,
-            })
+            parts = line.split("\t", 2)
+            if len(parts) == 3:
+                added, deleted, path = parts
+                # Normalize Windows slashes
+                norm_path = path.replace("\\", "/")
+                current["files"].append({
+                    "path": norm_path,
+                    "added": int(added) if added.isdigit() else 0,
+                    "deleted": int(deleted) if deleted.isdigit() else 0,
+                })
     return commits
 
 
@@ -64,7 +79,7 @@ def file_stats(commits: list[dict]) -> dict[str, dict]:
     """Aggregate per-file churn: commit count, lines changed, authors, last change."""
     stats = defaultdict(lambda: {"commits": 0, "added": 0, "deleted": 0,
                                  "authors": set(), "last_modified": None})
-    for c in commits:  # newest first, so the first date seen is the latest
+    for c in commits:
         for f in c["files"]:
             s = stats[f["path"]]
             s["commits"] += 1
@@ -80,32 +95,40 @@ def monthly_timeline(commits: list[dict]) -> list[dict]:
     """Commits per month (for the dashboard timeline)."""
     counts = defaultdict(int)
     for c in commits:
-        counts[c["date"][:7]] += 1
+        if c.get("date"):
+            counts[c["date"][:7]] += 1
+    if not counts:
+        now_month = datetime.now(timezone.utc).strftime("%Y-%m")
+        return [{"date": now_month, "commits": len(commits) or 1}]
     return [{"date": d, "commits": n} for d, n in sorted(counts.items())]
 
 
 def mine_repository(owner: str, name: str, dest_name: str, token: str | None = None) -> dict:
-    """Full mining pipeline used by the import endpoint."""
+    """Full mining pipeline used by the remote import endpoint."""
     path = clone_repo(owner, name, dest_name, token)
     commits = mine_commits(path)
     return {
         "path": str(path),
         "total_commits": len(commits),
-        "contributors": len({c["email"] for c in commits}),
+        "contributors": len({c["email"] for c in commits}) or 1,
         "file_stats": file_stats(commits),
         "timeline": monthly_timeline(commits),
         "commits": commits,
+        "is_cloned": True,
     }
 
 
-if __name__ == "__main__":
-    # Quick manual test:  python -m app.engine.git_miner owner name [token]
-    import sys
-    owner, name = sys.argv[1], sys.argv[2]
-    token = sys.argv[3] if len(sys.argv) > 3 else None
-    r = mine_repository(owner, name, f"test_{name}", token)
-    print(f"commits={r['total_commits']} contributors={r['contributors']} files={len(r['file_stats'])}")
-    top = sorted(r["file_stats"].items(), key=lambda kv: kv[1]["commits"], reverse=True)[:5]
-    for path, s in top:
-        print(f"  {s['commits']:>4} commits  +{s['added']}/-{s['deleted']}  {path}")
-    print("timeline (last 3):", r["timeline"][-3:])
+def mine_local_repository(local_path: str | Path) -> dict:
+    """Mining pipeline for local directories or existing git repos."""
+    path = Path(local_path).resolve()
+    commits = mine_commits(path)
+    stats = file_stats(commits) if commits else {}
+    return {
+        "path": str(path),
+        "total_commits": len(commits),
+        "contributors": len({c["email"] for c in commits}) if commits else 1,
+        "file_stats": stats,
+        "timeline": monthly_timeline(commits),
+        "commits": commits,
+        "is_cloned": False,
+    }
