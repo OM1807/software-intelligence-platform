@@ -11,6 +11,15 @@ from app.engine.parser import parse_source
 from app.main import app
 from app.models.schema import Analysis, ArchitectureRule, DependencyEdge, FileMetric, Repository, User
 
+engine = create_engine(
+    "sqlite://",
+    connect_args={"check_same_thread": False},
+    poolclass=StaticPool,
+)
+database_module.engine = engine
+database_module.SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+database_module.Base.metadata.create_all(bind=engine)
+
 
 def test_multilanguage_parser_python_js_java():
     # Python
