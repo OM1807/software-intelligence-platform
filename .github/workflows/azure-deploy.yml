@@ -2,9 +2,9 @@ name: Build, Test & Deploy to Azure
 
 on:
   push:
-    branches: [ improveREADME, main ]
+    branches: [ improveREADME ]
   pull_request:
-    branches: [ improveREADME, main ]
+    branches: [ improveREADME ]
   workflow_dispatch:
 
 permissions:
