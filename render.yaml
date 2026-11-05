@@ -24,6 +24,12 @@ services:
           type: web
           name: sip-frontend
           property: host
+      - key: BACKEND_URL
+        value: https://sip-backend-sft4.onrender.com
+      - key: GITHUB_CLIENT_ID
+        sync: false
+      - key: GITHUB_CLIENT_SECRET
+        sync: false
       - key: LLM_API_KEY
         sync: false
 
