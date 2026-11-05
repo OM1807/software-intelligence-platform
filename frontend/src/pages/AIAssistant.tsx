@@ -116,23 +116,21 @@ export default function AIAssistant() {
                   )}
 
                   <div
-                    className={`max-w-[80%] rounded-2xl px-4 py-3 text-sm leading-relaxed ${
-                      msg.role === 'user'
+                    className={`max-w-[80%] rounded-2xl px-4 py-3 text-sm leading-relaxed ${msg.role === 'user'
                         ? 'bg-blue-600 text-white rounded-tr-none'
                         : 'bg-slate-50 border border-slate-200 text-slate-800 rounded-tl-none'
-                    }`}
+                      }`}
                   >
                     {msg.role === 'assistant' ? (
-  <Markdown>{msg.content}</Markdown>
-) : (
-  <div className="whitespace-pre-wrap">{msg.content}</div>
-)}
+                      <Markdown>{msg.content}</Markdown>
+                    ) : (
+                      <div className="whitespace-pre-wrap">{msg.content}</div>
+                    )}
                     <div className="mt-2 flex items-center justify-between text-[10px] opacity-70">
                       <span>{msg.timestamp}</span>
                       {msg.provider && (
                         <span className="font-semibold uppercase tracking-wider">
-                          
-msg.provider === 'gemini' ? 'Gemini' : 'Built-in Analysis Engine'
+                          msg.provider === 'gemini' ? 'Gemini' : 'Built-in Analysis Engine'
                         </span>
                       )}
                     </div>
