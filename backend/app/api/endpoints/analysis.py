@@ -13,6 +13,7 @@ from app.engine.llm_service import (
     answer_repository_question,
     generate_ai_response,
     generate_structured_repo_explanation,
+    get_last_provider,
 )
 from app.engine.report_generator import build_report
 from app.engine.risk_calculator import HIGH_RISK_THRESHOLD, compute_health_index, recalculate_file_risk_scores
@@ -493,7 +494,7 @@ def ask_ai(
     }
 
     answer = answer_repository_question(summary, payload.question)
-    provider = "gemini" if settings.LLM_API_KEY else "local-intelligence-engine"
+    provider = get_last_provider()
     return AskAIResponse(repo_id=repo_id, question=payload.question, answer=answer, provider=provider)
 
 

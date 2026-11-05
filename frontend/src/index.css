@@ -90,3 +90,15 @@
   background: #94a3b8;
   border: none;
 }
+
+   /* Dependency graph: cheap CSS-only highlighting (no re-layout on click) */
+.dep-canvas.has-selection .react-flow__node:not(.is-related) { opacity: 0.28; }
+.dep-canvas.has-selection .react-flow__edge:not(.is-related) { opacity: 0.12; }
+.dep-canvas .react-flow__node.is-selected .dep-node {
+  border-color: #2563eb;
+  background: #eff6ff;
+  box-shadow: 0 4px 14px rgba(37, 99, 235, 0.3);
+}
+.dep-canvas .react-flow__node.is-related:not(.is-selected) .dep-node { border-color: #93c5fd; }
+.dep-canvas .react-flow__node { cursor: pointer; }
+.dep-canvas .react-flow__edge-path { shape-rendering: optimizeSpeed; }

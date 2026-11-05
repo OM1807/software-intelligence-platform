@@ -3,6 +3,7 @@ import { Bot, Send, Sparkles, AlertCircle, ArrowUpRight, HelpCircle, RefreshCw }
 import { api, type AskAIResponse } from '@/api';
 import { PageContainer, PageHeader } from '@/components/Page';
 import { useRepos } from '@/context/RepoContext';
+import Markdown from '@/components/Markdown';
 
 type ChatMessage = {
   role: 'user' | 'assistant';
@@ -121,12 +122,17 @@ export default function AIAssistant() {
                         : 'bg-slate-50 border border-slate-200 text-slate-800 rounded-tl-none'
                     }`}
                   >
-                    <div className="whitespace-pre-wrap">{msg.content}</div>
+                    {msg.role === 'assistant' ? (
+  <Markdown>{msg.content}</Markdown>
+) : (
+  <div className="whitespace-pre-wrap">{msg.content}</div>
+)}
                     <div className="mt-2 flex items-center justify-between text-[10px] opacity-70">
                       <span>{msg.timestamp}</span>
                       {msg.provider && (
                         <span className="font-semibold uppercase tracking-wider">
-                          via {msg.provider === 'gemini' ? 'Gemini 2.0' : 'Local Heuristics Engine'}
+                          
+msg.provider === 'gemini' ? 'Gemini' : 'Built-in Analysis Engine'
                         </span>
                       )}
                     </div>

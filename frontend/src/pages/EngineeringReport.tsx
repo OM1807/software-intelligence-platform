@@ -3,6 +3,8 @@ import { FileText, Sparkles } from 'lucide-react';
 import { api, type EngineeringReport as ReportData } from '@/api';
 import { PageContainer, PageHeader } from '@/components/Page';
 import { useRepos } from '@/context/RepoContext';
+// add this import at the top
+import Markdown from '@/components/Markdown';
 
 export default function EngineeringReport() {
   const { activeRepo } = useRepos();
@@ -50,7 +52,7 @@ export default function EngineeringReport() {
                   ['High-risk files', report.summary.high_risk_files],
                 ].map(([label, value]) => <div key={label} className="card"><p className="text-sm text-slate-500">{label}</p><p className="mt-2 text-2xl font-semibold text-slate-900">{value}</p></div>)}
               </div>
-              {report.ai_explanation && <div className="mt-6 card border-blue-100 bg-blue-50/50"><h2 className="flex items-center gap-2 text-sm font-semibold text-slate-800"><Sparkles size={17} className="text-blue-600" /> AI explanation</h2><p className="mt-3 whitespace-pre-wrap text-sm leading-relaxed text-slate-700">{report.ai_explanation}</p></div>}
+              {report.ai_explanation && <div className="mt-6 card border-blue-100 bg-blue-50/50"><h2 className="flex items-center gap-2 text-sm font-semibold text-slate-800"><Sparkles size={17} className="text-blue-600" /> AI explanation</h2><Markdown className="mt-3 text-sm text-slate-700">{report.ai_explanation}</Markdown></div>}
               <div className="mt-6 grid gap-6 lg:grid-cols-2">
                 <section className="card"><h2 className="mb-4 flex items-center gap-2 text-sm font-semibold text-slate-800"><FileText size={17} /> Recommendations</h2>{report.recommendations.length ? <ul className="space-y-4">{report.recommendations.map((item) => <li key={item.title}><p className="text-sm font-semibold text-slate-900">{item.title}</p><p className="mt-1 text-sm text-slate-600">{item.suggestion}</p></li>)}</ul> : <p className="text-sm text-slate-500">No recommendations were generated.</p>}</section>
                 <section className="card"><h2 className="mb-4 text-sm font-semibold text-slate-800">Highest-risk files</h2>{report.highest_risk_files.length ? <ul className="space-y-3">{report.highest_risk_files.map((file) => <li key={file.path} className="flex justify-between gap-3 text-sm"><span className="truncate">{file.path}</span><span className="font-medium text-red-600">{(file.risk_score * 100).toFixed(0)}</span></li>)}</ul> : <p className="text-sm text-slate-500">No risky files found.</p>}</section>

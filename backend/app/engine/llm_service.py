@@ -1,17 +1,70 @@
+import hashlib
 import logging
+import random
+import threading
 import time
 
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
-MODEL_NAME = "gemini-flash-latest"
-MAX_ATTEMPTS = 3
-RETRYABLE_STATUS_CODES = (500, 502, 503, 504)
+# Tried in order. Each free-tier model has its own quota and its own load,
+# so when one is busy or exhausted the next one usually still works.
+# Override without code changes: GEMINI_MODELS=model-a,model-b in backend/.env
+DEFAULT_MODELS = (
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-flash-latest",
+    "gemini-2.0-flash",
+)
+ATTEMPTS_PER_MODEL = 2          # for temporary 5xx errors only
+BASE_DELAY_SECONDS = 1.5
+REQUEST_TIMEOUT_MS = 20_000
+SERVER_RETRY_CODES = {500, 502, 503, 504}   # "unavailable / high demand": retry, then next model
+NEXT_MODEL_CODES = {404, 429}               # model missing / quota hit: go straight to next model
+
+CACHE_TTL_SECONDS = 600
+CACHE_MAX_ITEMS = 128
+_cache: dict[str, tuple[float, str]] = {}
+_cache_lock = threading.Lock()
+
+LOCAL_PROVIDER = "local-intelligence-engine"
+_state = threading.local()
+
+
+def get_last_provider() -> str:
+    """Which engine produced the most recent answer in this request thread."""
+    return getattr(_state, "provider", LOCAL_PROVIDER)
+
+
+def _set_provider(value: str) -> None:
+    _state.provider = value
+
+
+def _models() -> list[str]:
+    raw = getattr(settings, "GEMINI_MODELS", "") or ""
+    custom = [m.strip() for m in raw.split(",") if m.strip()]
+    return custom or list(DEFAULT_MODELS)
+
+
+def _cache_get(key: str) -> str | None:
+    with _cache_lock:
+        hit = _cache.get(key)
+        if hit and time.time() - hit[0] < CACHE_TTL_SECONDS:
+            return hit[1]
+        _cache.pop(key, None)
+    return None
+
+
+def _cache_put(key: str, value: str) -> None:
+    with _cache_lock:
+        if len(_cache) >= CACHE_MAX_ITEMS:
+            _cache.pop(min(_cache, key=lambda k: _cache[k][0]), None)
+        _cache[key] = (time.time(), value)
 
 
 def generate_ai_response(prompt: str) -> str:
-    """Generate a response using Gemini with retries for temporary failures."""
+    """Generate a response with Gemini, retrying busy errors and falling back across models."""
     if not prompt or not prompt.strip():
         raise ValueError("Prompt cannot be empty.")
 
@@ -19,34 +72,60 @@ def generate_ai_response(prompt: str) -> str:
     if not api_key or not api_key.strip():
         raise RuntimeError("Gemini API key is not configured.")
 
+    prompt = prompt.strip()
+    cache_key = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+    cached = _cache_get(cache_key)
+    if cached:
+        _set_provider("gemini")
+        return cached
+
     from google import genai
-    from google.genai import errors
+    from google.genai import errors, types
 
-    client = genai.Client(api_key=api_key)
+    client = genai.Client(
+        api_key=api_key.strip(),
+        http_options=types.HttpOptions(timeout=REQUEST_TIMEOUT_MS),
+    )
 
-    for attempt in range(1, MAX_ATTEMPTS + 1):
-        try:
-            response = client.models.generate_content(
-                model=MODEL_NAME,
-                contents=prompt.strip(),
-            )
-            answer = response.text
-            if not answer or not answer.strip():
-                raise RuntimeError("Gemini returned an empty response.")
-            return answer.strip()
+    last_error: Exception | None = None
+    for model in _models():
+        for attempt in range(1, ATTEMPTS_PER_MODEL + 1):
+            try:
+                response = client.models.generate_content(model=model, contents=prompt)
+                answer = (response.text or "").strip()
+                if not answer:
+                    raise RuntimeError("Gemini returned an empty response.")
+                _cache_put(cache_key, answer)
+                _set_provider("gemini")
+                logger.info("Gemini answered using %s (attempt %s).", model, attempt)
+                return answer
 
-        except errors.ServerError as exc:
-            if attempt == MAX_ATTEMPTS or exc.code not in RETRYABLE_STATUS_CODES:
-                logger.exception("Gemini server request failed.")
+            except errors.APIError as exc:
+                last_error = exc
+                code = getattr(exc, "code", None)
+                if code in SERVER_RETRY_CODES and attempt < ATTEMPTS_PER_MODEL:
+                    delay = BASE_DELAY_SECONDS * (2 ** (attempt - 1)) + random.uniform(0, 0.75)
+                    logger.warning("%s busy (HTTP %s). Retry %s/%s in %.1fs.", model, code, attempt, ATTEMPTS_PER_MODEL, delay)
+                    time.sleep(delay)
+                    continue
+                if code in SERVER_RETRY_CODES or code in NEXT_MODEL_CODES:
+                    logger.warning("%s unavailable (HTTP %s). Trying next model.", model, code)
+                    break
+                # Bad key, permission or malformed request: other models will fail the same way.
+                logger.error("Gemini request rejected (HTTP %s): %s", code, exc)
                 raise
-            delay = 2 ** attempt
-            logger.warning("Gemini temporarily unavailable. Retry %s/%s in %s seconds.", attempt, MAX_ATTEMPTS, delay)
-            time.sleep(delay)
-        except Exception:
-            logger.exception("Gemini API request failed.")
-            raise
 
-    raise RuntimeError("Gemini request failed after retries.")
+            except RuntimeError as exc:  # empty response -> try next model
+                last_error = exc
+                logger.warning("%s returned an empty response. Trying next model.", model)
+                break
+
+            except Exception as exc:  # network / timeout -> try next model
+                last_error = exc
+                logger.warning("%s request failed (%s). Trying next model.", model, type(exc).__name__)
+                break
+
+    raise RuntimeError("All Gemini models are currently busy or unavailable.") from last_error
 
 
 def _generate_deterministic_explanation(summary: dict) -> str:
@@ -113,6 +192,7 @@ def generate_structured_repo_explanation(summary: dict, *, max_items: int = 5) -
     if not summary:
         return None
 
+    _set_provider(LOCAL_PROVIDER)
     api_key = settings.LLM_API_KEY
     if not api_key or not api_key.strip():
         return _generate_deterministic_explanation(summary)
@@ -157,6 +237,7 @@ def answer_repository_question(summary: dict, question: str) -> str:
     """Answer questions from developers and architects about repository metrics, architecture, and risk."""
     q_lower = question.lower().strip()
     api_key = settings.LLM_API_KEY
+    _set_provider(LOCAL_PROVIDER)
 
     if api_key and api_key.strip():
         system_context = (
