@@ -36,7 +36,6 @@ services:
     rootDir: frontend
     buildCommand: npm install && npm run build
     staticPublishPath: dist
-    plan: free
     branch: improveREADME
     envVars:
       - key: VITE_API_URL
