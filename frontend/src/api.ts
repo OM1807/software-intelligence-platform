@@ -1,4 +1,5 @@
-const API_URL = (import.meta.env.VITE_API_URL || 'http://localhost:8000').replace(/\/$/, '');
+const rawApiUrl = (import.meta.env.VITE_API_URL || 'http://localhost:8000').trim();
+const API_URL = (rawApiUrl.startsWith('http://') || rawApiUrl.startsWith('https://') ? rawApiUrl : 'https://' + rawApiUrl).replace(/\/$/, '');
 const tokenKey = 'sip.access_token';
 
 export type UserRole = 'developer' | 'architect' | 'administrator';

@@ -37,14 +37,13 @@ services:
     buildCommand: npm install && npm run build
     staticPublishPath: dist
     plan: free
-    region: oregon
     branch: improveREADME
     envVars:
       - key: VITE_API_URL
         fromService:
           type: web
           name: sip-backend
-          property: url
+          property: host
     routes:
       - type: rewrite
         source: /*

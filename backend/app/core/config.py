@@ -38,12 +38,12 @@ class Settings(BaseSettings):
         return self.ENVIRONMENT.lower() == "production"
 
     def validate(self) -> "Settings":
+        if self.FRONTEND_URL and not self.FRONTEND_URL.startswith(("http://", "https://")):
+            self.FRONTEND_URL = f"https://{self.FRONTEND_URL}"
+        if self.BACKEND_URL and not self.BACKEND_URL.startswith(("http://", "https://")):
+            self.BACKEND_URL = f"https://{self.BACKEND_URL}"
         if self.is_production and self.SECRET_KEY in {"change-me", "change-me-in-env"}:
             raise ValueError("SECRET_KEY must be set to a non-default value in production.")
-        if not self.FRONTEND_URL.startswith(("http://", "https://")):
-            raise ValueError("FRONTEND_URL must start with http:// or https://")
-        if not self.BACKEND_URL.startswith(("http://", "https://")):
-            raise ValueError("BACKEND_URL must start with http:// or https://")
         return self
 
 
