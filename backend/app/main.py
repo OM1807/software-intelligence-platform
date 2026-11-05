@@ -1,4 +1,4 @@
-﻿import time
+import time
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -14,22 +14,25 @@ from app.models.schema import Repository
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    if settings.AUTO_CREATE_SCHEMA and settings.ENVIRONMENT.lower() == "development":
+    if settings.AUTO_CREATE_SCHEMA:
         for attempt in range(15):
             try:
                 database_module.Base.metadata.create_all(bind=database_module.engine)
                 break
-            except OperationalError:
+            except Exception:
                 if attempt == 14:
                     raise
                 time.sleep(2)
-    else:
-        # Production/deployment expects migrations to manage schema evolution.
+
+    try:
+        with database_module.SessionLocal() as db:
+            db.query(Repository).filter_by(status="processing").update(
+                {"status": "failed", "error": "Interrupted by server restart. Please import again."})
+            db.commit()
+    except Exception:
+        # Safe if tables are not yet populated or on initial clean start
         pass
-    with database_module.SessionLocal() as db:
-        db.query(Repository).filter_by(status="processing").update(
-            {"status": "failed", "error": "Interrupted by server restart. Please import again."})
-        db.commit()
+
     yield
 
 
