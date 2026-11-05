@@ -1,5 +1,9 @@
 const rawApiUrl = (import.meta.env.VITE_API_URL || 'http://localhost:8000').trim();
-const API_URL = (rawApiUrl.startsWith('http://') || rawApiUrl.startsWith('https://') ? rawApiUrl : 'https://' + rawApiUrl).replace(/\/$/, '');
+let resolvedUrl = rawApiUrl;
+if (resolvedUrl && !resolvedUrl.includes('.') && !resolvedUrl.includes('localhost')) {
+  resolvedUrl = resolvedUrl + '.onrender.com';
+}
+const API_URL = (resolvedUrl.startsWith('http://') || resolvedUrl.startsWith('https://') ? resolvedUrl : 'https://' + resolvedUrl).replace(/\/$/, '');
 const tokenKey = 'sip.access_token';
 
 export type UserRole = 'developer' | 'architect' | 'administrator';

@@ -39,10 +39,7 @@ services:
     branch: improveREADME
     envVars:
       - key: VITE_API_URL
-        fromService:
-          type: web
-          name: sip-backend
-          property: host
+        value: https://sip-backend-sft4.onrender.com
     routes:
       - type: rewrite
         source: /*
