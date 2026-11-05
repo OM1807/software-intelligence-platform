@@ -20,10 +20,7 @@ services:
           name: sip-db
           property: connectionString
       - key: FRONTEND_URL
-        fromService:
-          type: web
-          name: sip-frontend
-          property: host
+        value: https://sip-frontend-oi5w.onrender.com
       - key: BACKEND_URL
         value: https://sip-backend-sft4.onrender.com
       - key: GITHUB_CLIENT_ID
